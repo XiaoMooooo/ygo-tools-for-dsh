@@ -3,6 +3,11 @@
   "version": "1.2.1",
   "private": true,
   "license": "0BSD",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XiaoMooooo/ygo-tools-for-dsh.git",
+    "directory": "skill"
+  },
   "type": "module",
   "description": "DeepSeek Harness-native Yu-Gi-Oh model-tool source with persistent sessions and verified engine execution.",
   "files": [

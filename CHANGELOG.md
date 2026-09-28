@@ -1,6 +1,10 @@
 # Changelog
 
-## 1.2.1 — 2026-08-22
+## Unreleased
+
+- 文档与元数据：README 的安装命令改为指向本仓库与 `desktop` profile（原先指向上游与 `web` profile）；`package.json` 补上 `repository` / `homepage` / `bugs`，`skill/package.json` 补 `repository` 并标注 `directory: skill`。
+
+## 1.2.1 — 2026-09-28
 
 ### 安全与正确性
 

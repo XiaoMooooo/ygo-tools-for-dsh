@@ -4,6 +4,14 @@
   "description": "Native DeepSeek Harness tools for Yu-Gi-Oh card research, deck analysis, verified duel simulation, replay analysis, and YGOPro2 bridging.",
   "private": true,
   "license": "0BSD",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XiaoMooooo/ygo-tools-for-dsh.git"
+  },
+  "homepage": "https://github.com/XiaoMooooo/ygo-tools-for-dsh#readme",
+  "bugs": {
+    "url": "https://github.com/XiaoMooooo/ygo-tools-for-dsh/issues"
+  },
   "type": "module",
   "main": "lib/index.js",
   "exports": {
