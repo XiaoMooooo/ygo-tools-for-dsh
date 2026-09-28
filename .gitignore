@@ -11,6 +11,9 @@ runtime/.cache/
 *.log
 .DS_Store
 
+# Scratch space used by tests/
+tests/.sandbox/
+
 # Local configuration and credentials
 .env
 .env.*

@@ -6930,18 +6930,33 @@ async function runParallelRandomSearch(job) {
 
     const searchStartNs = process.hrtime.bigint();
     const settled = await Promise.all(workers.map((worker) => new Promise((resolve, reject) => {
-      worker.once('message', (message) => {
+      // A worker may report several non-terminal messages (progress, and the
+      // same 'ready' handshake the barrier above consumed) before its result,
+      // so this listener must stay attached and filter by type. The previous
+      // once('message') version rejected the whole search on the first
+      // progress message.
+      function cleanup() {
+        worker.off('message', onMessage);
+        worker.off('error', onError);
+      }
+      function onMessage(message) {
         if (message?.type === 'result') {
+          cleanup();
           resolve(message.payload);
           return;
         }
         if (message?.type === 'error') {
+          cleanup();
           reject(new Error(message.error || 'worker search failed'));
-          return;
         }
-        reject(new Error('worker returned unexpected message'));
-      });
-      worker.once('error', reject);
+        // Any other message type is advisory; keep waiting for the result.
+      }
+      function onError(error) {
+        cleanup();
+        reject(error);
+      }
+      worker.on('message', onMessage);
+      worker.on('error', onError);
       worker.send({ type: 'run' });
     })));
     const searchElapsedMs = Number(process.hrtime.bigint() - searchStartNs) / 1e6;

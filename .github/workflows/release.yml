@@ -8,7 +8,33 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Assert the tag matches every package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          root=$(node -p "require('./package.json').version")
+          skill=$(node -p "require('./skill/package.json').version")
+          echo "tag=$tag root=$root skill=$skill"
+          if [ "$tag" != "$root" ]; then
+            echo "::error::tag v$tag does not match package.json version $root"
+            exit 1
+          fi
+          if [ "$root" != "$skill" ]; then
+            echo "::error::skill/package.json version $skill does not match root $root"
+            exit 1
+          fi
+      - name: Run the regression suite
+        run: npm test
+
   release:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +45,11 @@ jobs:
         run: |
           mkdir -p dist
           npm pack --pack-destination ./dist
+          # A stable asset name lets the README point at releases/latest instead
+          # of hardcoding a version that drifts on every release.
+          cp dist/ygo-tools-for-dsh-*.tgz dist/ygo-tools-for-dsh.tgz
       - name: Write checksums
-        run: sha256sum dist/*.tgz > dist/SHA256SUMS.txt
+        run: cd dist && sha256sum *.tgz > SHA256SUMS.txt
       - name: Upload tarball to release
         uses: softprops/action-gh-release@v2
         with:

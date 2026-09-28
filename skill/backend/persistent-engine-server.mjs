@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { createModelToolHost } from './model-tool-host.mjs';
+import { ENGINE_TOKEN_ENV, ENGINE_TOKEN_HEADER, isEngineTokenValid } from './engine-token.mjs';
 
 export const ENGINE_HOST_PROTOCOL = 'ygoagentskill-engine-host-v1';
 export const DEFAULT_ENGINE_HOST = '127.0.0.1';
@@ -13,12 +15,27 @@ const MAX_RESPONSE_NODES = 20000;
 export function createPersistentEngineServer(options = {}) {
   const hostname = readString(options.hostname) ?? DEFAULT_ENGINE_HOST;
   const port = normalizePort(options.port ?? DEFAULT_ENGINE_PORT);
+  // `/health` stays unauthenticated so a client can still tell "port occupied by
+  // an incompatible service" from "engine host not started yet". Every endpoint
+  // that can read or mutate duel state requires the token.
+  //
+  // Enforcement is opt-in on a token being configured (CLI/env): the plugin
+  // client always supplies one, while direct in-process embedding — tests, a
+  // host started by hand — stays unauthenticated exactly as before.
+  const expectedToken = readString(options.token) ?? readString(process.env[ENGINE_TOKEN_ENV]);
   const startedAt = new Date().toISOString();
   let closing = false;
   let server;
   const host = createModelToolHost(options.backendConfig ?? {}, {
     onShutdown() {
       closing = true;
+      // Release every session (duel runners, YGOPro2 temp directories) before
+      // the listener goes away; close() alone left detached runners behind.
+      try {
+        host.clearSessions();
+      } catch {
+        // Shutdown must stay best-effort.
+      }
       server?.close(() => {
         if (options.exitOnShutdown === true) process.exit(0);
       });
@@ -38,6 +55,13 @@ export function createPersistentEngineServer(options = {}) {
           startedAt,
           closing,
           sessionCount: host.sessions.size,
+        });
+      }
+      if (expectedToken && !isEngineTokenValid(request.headers[ENGINE_TOKEN_HEADER], expectedToken)) {
+        return sendJson(response, 401, {
+          ok: false,
+          code: 'UNAUTHORIZED',
+          error: `Persistent engine host requires a valid ${ENGINE_TOKEN_HEADER} header.`,
         });
       }
       if (request.method === 'GET' && request.url?.startsWith('/tools')) {
@@ -163,7 +187,13 @@ function readString(value) {
 }
 
 function isMainModule() {
-  return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+  if (!process.argv[1]) return false;
+  try {
+    const entry = pathToFileURL(realpathSync(process.argv[1])).href;
+    return import.meta.url === entry;
+  } catch {
+    return import.meta.url === pathToFileURL(process.argv[1]).href;
+  }
 }
 
 if (isMainModule()) {

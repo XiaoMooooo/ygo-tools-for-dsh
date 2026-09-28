@@ -1156,16 +1156,26 @@ function createExactParallelRuntimeApi(deps) {
           resolve();
           return;
         }
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
         const killTimer = setTimeout(() => {
           try {
             worker.kill();
           } catch {
-            resolve();
+            // The worker may already be gone; either way this promise must settle.
+          } finally {
+            // Without this the shutdown await hangs forever whenever kill()
+            // succeeds but no 'exit' event is delivered.
+            done();
           }
         }, 1000);
         worker.once('exit', () => {
           clearTimeout(killTimer);
-          resolve();
+          done();
         });
         try {
           worker.send({ type: 'shutdown' });
@@ -1174,7 +1184,7 @@ function createExactParallelRuntimeApi(deps) {
           try {
             worker.kill();
           } finally {
-            resolve();
+            done();
           }
         }
       })));

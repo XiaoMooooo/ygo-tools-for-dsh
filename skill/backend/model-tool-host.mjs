@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createYgoBackend } from './factory.mjs';
 import {
   getPublicToolInputSchema,
+  PUBLIC_TOOL_ACTIONS,
   PUBLIC_TOOL_DESCRIPTIONS,
   PUBLIC_TOOL_NAMES,
   validatePublicToolInput,
@@ -11,24 +12,71 @@ export const HOST_CONTROL_TOOL_NAMES = Object.freeze([
   'manageEngineSession',
 ]);
 
+// A live session holds a duel runner (WASM core state, checkpoints, and for a
+// YGOPro2 duel a WindBot child process), so an engine host that never forgets a
+// session grows without bound. Session keys are derived from the DSH agent id,
+// which means every subagent run used to add one permanent entry.
+const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+export function resolveSessionIdleTimeoutMs(value = process.env.YGO_SESSION_IDLE_TIMEOUT_MS) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_SESSION_IDLE_TIMEOUT_MS;
+  // 0 (or a negative value) disables reaping for long-running research sessions.
+  if (parsed <= 0) return 0;
+  return Math.max(parsed, 30_000);
+}
+
 export function createModelToolHost(config = {}, hostOptions = {}) {
   const backend = createYgoBackend(config);
   const sessions = new Map();
+  const sessionLastUsedAt = new Map();
+  const idleTimeoutMs = hostOptions.idleTimeoutMs ?? resolveSessionIdleTimeoutMs();
+
+  function touchSession(id) {
+    sessionLastUsedAt.set(id, Date.now());
+  }
+
+  /**
+   * Drop sessions that have not been used for `idleTimeoutMs`.
+   *
+   * Reaping is lazy (called before serving a call) rather than timer-driven so
+   * the host never holds the event loop open just to expire sessions.
+   */
+  function reapIdleSessions(now = Date.now()) {
+    if (!idleTimeoutMs) return [];
+    const reaped = [];
+    for (const [id, lastUsedAt] of sessionLastUsedAt) {
+      if (now - lastUsedAt < idleTimeoutMs) continue;
+      const session = sessions.get(id);
+      if (session) disposeSession(session);
+      sessions.delete(id);
+      sessionLastUsedAt.delete(id);
+      reaped.push(id);
+    }
+    return reaped;
+  }
 
   function createSession(sessionId = randomUUID(), initial = {}) {
     const id = normalizeSessionId(sessionId);
     if (sessions.has(id)) throw new Error(`YGO model-tool session already exists: ${id}`);
     const session = backend.createSession(initial);
     sessions.set(id, session);
+    touchSession(id);
     return { sessionId: id, session };
   }
 
   function ensureSession(sessionId = 'default') {
     const id = normalizeSessionId(sessionId);
-    return sessions.get(id) ?? createSession(id).session;
+    const existing = sessions.get(id);
+    if (existing) {
+      touchSession(id);
+      return existing;
+    }
+    return createSession(id).session;
   }
 
   async function execute(call, options = {}) {
+    reapIdleSessions();
     const normalized = normalizeToolCall(call);
     if (!normalized.name) {
       return { ok: false, code: 'INVALID_TOOL_CALL', error: 'Tool call requires a name.' };
@@ -110,6 +158,16 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
         },
       };
     }
+    if (action !== 'clear' && action !== 'shutdown') {
+      // Without this guard any unrecognized action that happened to pass the
+      // confirm check used to fall through to the shutdown branch below.
+      return {
+        ok: false,
+        code: 'INVALID_ACTION',
+        error: `Unknown engine session action ${JSON.stringify(action ?? null)}.`,
+        data: { availableActions: ['status', 'clear', 'shutdown'] },
+      };
+    }
     if (input.confirm !== true) {
       return { ok: false, code: 'EXPLICIT_CONFIRMATION_REQUIRED', error: `${action} requires confirm:true.` };
     }
@@ -136,71 +194,57 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
     const payload = withoutKeys(input, 'action');
     const executeBackend = (toolName, toolInput = payload) => backend.executeTool(toolName, context, toolInput);
 
-    switch (name) {
-      case 'queryCards':
-        return executeBackend(action === 'get' ? 'getCardEffect' : 'searchCards');
-      case 'manageCardDataSources':
-        return executeBackend(action === 'inspect' ? 'inspectCardDataSources' : 'refreshCardDataSources');
-      case 'manageYgoPro2':
-        return executeBackend(action === 'discover' ? 'discoverYgoPro2' : 'getYgoPro2BridgeStatus');
-      case 'getBanlistContext':
-      case 'executeAction':
-      case 'simulateActions':
-        return executeBackend(name, input);
-      case 'manageSessionDeck':
-        return executeBackend({
-          set: 'setSessionDeck',
-          get: 'getSessionDeck',
-          check: 'checkDeckCards',
-          edit: 'editSessionDeck',
-          export: 'exportSessionDeck',
-        }[action]);
-      case 'resetGame': {
-        if (input.fixedOpening !== undefined && input.clearFixedOpening === true) {
-          return { ok: false, code: 'CONFLICTING_FIXED_OPENING', error: 'fixedOpening and clearFixedOpening cannot be used together.' };
-        }
-        let fixedOpeningResult = null;
-        if (input.fixedOpening !== undefined) {
-          fixedOpeningResult = await executeBackend('setFixedOpening', { cards: input.fixedOpening });
-        } else if (input.clearFixedOpening === true) {
-          fixedOpeningResult = await executeBackend('setFixedOpening', { clear: true, confirmUserRequestedClear: true });
-        }
-        if (fixedOpeningResult?.ok === false) return fixedOpeningResult;
-        const resetResult = await executeBackend('resetGame', withoutKeys(input, 'fixedOpening', 'clearFixedOpening'));
-        if (!fixedOpeningResult || resetResult?.ok === false) return resetResult;
-        return {
-          ...resetResult,
-          data: { ...asRecord(resetResult.data), fixedOpening: fixedOpeningResult.data },
-        };
+    // resetGame and analyzeReplay compose several internal tools, so they keep
+    // explicit logic; every other action fans out through PUBLIC_TOOL_ACTIONS.
+    if (name === 'resetGame') {
+      if (input.fixedOpening !== undefined && input.clearFixedOpening === true) {
+        return { ok: false, code: 'CONFLICTING_FIXED_OPENING', error: 'fixedOpening and clearFixedOpening cannot be used together.' };
       }
-      case 'observeDuel':
-        return executeBackend(action === 'state' ? 'getCurrentState' : 'listActions');
-      case 'manageCheckpoint':
-        return executeBackend({
-          save: 'saveCheckpoint',
-          restore: 'restoreCheckpoint',
-          list: 'listCheckpoints',
-          delete: 'deleteCheckpoint',
-        }[action]);
-      case 'analyzeReplay': {
-        if (action === 'context') return executeBackend('buildRouteContext');
-        const parsed = await executeBackend('parseYrpRoute');
-        if (parsed?.ok === false || action === 'parse') {
-          if (parsed?.ok) rememberParsedReplay(session, parsed.data);
-          return parsed;
-        }
-        rememberParsedReplay(session, parsed.data);
-        const contextResult = await executeBackend('buildRouteContext', asRecord(parsed.data));
-        if (contextResult?.ok === false) return contextResult;
-        return { ok: true, data: { parsed: parsed.data, context: contextResult.data } };
+      let fixedOpeningResult = null;
+      if (input.fixedOpening !== undefined) {
+        fixedOpeningResult = await executeBackend('setFixedOpening', { cards: input.fixedOpening });
+      } else if (input.clearFixedOpening === true) {
+        fixedOpeningResult = await executeBackend('setFixedOpening', { clear: true, confirmUserRequestedClear: true });
       }
-      case 'analyzeCombo':
-        return executeBackend(action === 'parse' ? 'parseComboArtifact' : 'buildComboAdaptationContext');
-      case 'saveArtifact':
-        return executeBackend(action === 'replay' ? 'saveReplayYrp' : 'saveRouteFile');
-      default:
-        return { ok: false, code: 'UNKNOWN_TOOL', error: `Unknown YGO model tool: ${name}` };
+      if (fixedOpeningResult?.ok === false) return fixedOpeningResult;
+      const resetResult = await executeBackend('resetGame', withoutKeys(input, 'fixedOpening', 'clearFixedOpening'));
+      if (!fixedOpeningResult || resetResult?.ok === false) return resetResult;
+      return {
+        ...resetResult,
+        data: { ...asRecord(resetResult.data), fixedOpening: fixedOpeningResult.data },
+      };
     }
+
+    if (name === 'analyzeReplay') {
+      if (action === 'context') return executeBackend('buildRouteContext');
+      const parsed = await executeBackend('parseYrpRoute');
+      if (parsed?.ok === false || action === 'parse') {
+        if (parsed?.ok) rememberParsedReplay(session, parsed.data);
+        return parsed;
+      }
+      rememberParsedReplay(session, parsed.data);
+      const contextResult = await executeBackend('buildRouteContext', asRecord(parsed.data));
+      if (contextResult?.ok === false) return contextResult;
+      return { ok: true, data: { parsed: parsed.data, context: contextResult.data } };
+    }
+
+    const actions = PUBLIC_TOOL_ACTIONS[name];
+    // Tools with no action table entry take no `action` argument and run
+    // themselves (getBanlistContext, executeAction, simulateActions).
+    if (!actions) return executeBackend(name, input);
+
+    const entry = actions[action];
+    if (!entry) {
+      // validatePublicToolInput rejects this first; the guard stays so a direct
+      // caller can never fall through to a silently different tool.
+      return {
+        ok: false,
+        code: 'INVALID_ACTION',
+        error: `Unknown action ${JSON.stringify(action ?? null)} for ${name}.`,
+        data: { availableActions: Object.keys(actions) },
+      };
+    }
+    return executeBackend(entry.tool);
   }
 
   const listToolSchemas = () => PUBLIC_TOOL_NAMES.map((name) => ({
@@ -212,21 +256,30 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
   return {
     backend,
     sessions,
+    idleTimeoutMs,
     createSession,
     ensureSession,
-    getSession: (sessionId = 'default') => sessions.get(normalizeSessionId(sessionId)) ?? null,
+    getSession: (sessionId = 'default') => {
+      const id = normalizeSessionId(sessionId);
+      const session = sessions.get(id);
+      if (session) touchSession(id);
+      return session ?? null;
+    },
     listSessions: () => [...sessions.keys()],
     hasSession: (sessionId) => sessions.has(normalizeSessionId(sessionId)),
     deleteSession: (sessionId) => {
       const id = normalizeSessionId(sessionId);
       const session = sessions.get(id);
       if (session) disposeSession(session);
+      sessionLastUsedAt.delete(id);
       return sessions.delete(id);
     },
     clearSessions: () => {
       for (const session of sessions.values()) disposeSession(session);
       sessions.clear();
+      sessionLastUsedAt.clear();
     },
+    reapIdleSessions,
     listTools: () => listToolSchemas(),
     execute,
   };

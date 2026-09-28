@@ -19,6 +19,7 @@ import {
   getYgoPro2BridgeStatus,
   isYgoPro2DuelRunner,
 } from './ygopro2-duel.mjs';
+import { checkFileWriteAuthorization, isInsideDirectory } from '../runtime/src/tools/file-write-policy.js';
 
 const CORE_MODULES = Object.freeze({
   cardsDb: 'src/database/cards-db.js',
@@ -925,9 +926,20 @@ async function exportSessionDeck(context, input, config) {
   if (input.save === true || requested) {
     const authorization = checkFileWriteAuthorization(config, input, 'exportSessionDeck');
     if (!authorization.ok) return authorization;
-    const baseDir = readString(config.deckDir) ?? resolve(config.skillRoot, 'output', 'decks');
+    const baseDir = authorization.directory;
     const target = requested ?? readString(session.metadata.currentDeckName) ?? 'deck.ydk';
     savedPath = resolve(baseDir, /\.ydk$/i.test(target) ? target : `${target}.ydk`);
+    // The policy above already rejected traversing file names; this second check
+    // keeps the invariant local to the write so a future edit cannot quietly
+    // reintroduce an escape (e.g. via a `..` sequence plus extension append).
+    if (!isInsideDirectory(savedPath, baseDir)) {
+      return {
+        ok: false,
+        code: 'WRITE_PATH_ESCAPES_OUTPUT_ROOT',
+        error: `exportSessionDeck refused a file target outside the configured deck directory: ${savedPath} is not inside ${baseDir}.`,
+        data: { requestedFile: target, resolvedPath: savedPath, allowedRoot: baseDir },
+      };
+    }
     await mkdir(dirname(savedPath), { recursive: true });
     await writeFile(savedPath, ydk, 'utf8');
   }
@@ -1063,7 +1075,7 @@ async function saveReplayYrpPortable(config, _moduleCache, context, input) {
     };
   }
 
-  const outputDir = resolve(readString(record.replayDir) ?? config.replayDir);
+  const outputDir = authorization.directory;
   const fileName = buildSafeReplayFileName(
     readString(record.fileName) ?? readString(record.title) ?? `agent-replay-${new Date().toISOString()}`,
   );
@@ -1229,7 +1241,7 @@ async function saveYgoPro2ReplayPortable(config, context, input) {
     };
   }
 
-  const outputDir = resolve(readString(record.replayDir) ?? config.replayDir);
+  const outputDir = authorization.directory;
   const fileName = buildSafeReplayFileName(
     readString(record.fileName) ?? readString(record.title) ?? `ai-server-replay-${new Date().toISOString()}`,
   );
@@ -1319,7 +1331,7 @@ async function saveRouteFilePortable(config, moduleCache, context, input) {
   if (!validation.ok) return validation;
 
   const format = normalizeRouteFormat(record.format);
-  const outputDir = resolve(readString(record.routeDir) ?? config.routeDir);
+  const outputDir = authorization.directory;
   const fileName = buildSafeRouteFileName(
     readString(record.fileName) ?? readString(record.title) ?? 'route',
     format,
@@ -1348,13 +1360,6 @@ function firstNonEmptyRecord(records) {
     if (Object.keys(record).length > 0) return record;
   }
   return {};
-}
-
-function checkFileWriteAuthorization(config, input, operation) {
-  void config;
-  void input;
-  void operation;
-  return { ok: true };
 }
 
 function toToolSchema(tool) {
@@ -1711,16 +1716,6 @@ function buildSafeRouteFileName(rawName, format) {
     .replace(/^-+|-+$/g, '')
     .slice(0, 80) || 'route';
   return base.toLowerCase().endsWith(extension) ? base : `${base}${extension}`;
-}
-
-function isInsideDirectory(targetPath, directory) {
-  const normalizedDirectory = normalizePathForComparison(directory);
-  const normalizedTarget = normalizePathForComparison(targetPath);
-  return normalizedTarget === normalizedDirectory || normalizedTarget.startsWith(`${normalizedDirectory}/`);
-}
-
-function normalizePathForComparison(targetPath) {
-  return resolve(targetPath).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
 function normalizeRouteFormat(value) {

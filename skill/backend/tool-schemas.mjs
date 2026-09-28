@@ -412,11 +412,68 @@ export const PUBLIC_TOOL_DESCRIPTIONS = Object.freeze({
   manageEngineSession: 'Inspect, clear, or fully shut down the persistent engine session host.',
 });
 
+// Single source of truth for public action routing: which internal tool each
+// public `action` reaches. The schema layer (conditional requirements) and the
+// dispatcher both read this table, so an action can no longer exist in one and
+// be silently missing from the other. Tools absent from this map take no
+// `action` argument at all.
+export const PUBLIC_TOOL_ACTIONS = Object.freeze({
+  queryCards: Object.freeze({
+    get: Object.freeze({ tool: 'getCardEffect' }),
+    search: Object.freeze({ tool: 'searchCards' }),
+  }),
+  manageCardDataSources: Object.freeze({
+    inspect: Object.freeze({ tool: 'inspectCardDataSources' }),
+    refresh: Object.freeze({ tool: 'refreshCardDataSources' }),
+  }),
+  manageYgoPro2: Object.freeze({
+    discover: Object.freeze({ tool: 'discoverYgoPro2' }),
+    status: Object.freeze({ tool: 'getYgoPro2BridgeStatus' }),
+  }),
+  manageSessionDeck: Object.freeze({
+    set: Object.freeze({ tool: 'setSessionDeck' }),
+    get: Object.freeze({ tool: 'getSessionDeck' }),
+    check: Object.freeze({ tool: 'checkDeckCards' }),
+    edit: Object.freeze({ tool: 'editSessionDeck' }),
+    export: Object.freeze({ tool: 'exportSessionDeck' }),
+  }),
+  observeDuel: Object.freeze({
+    state: Object.freeze({ tool: 'getCurrentState' }),
+    actions: Object.freeze({ tool: 'listActions' }),
+  }),
+  manageCheckpoint: Object.freeze({
+    save: Object.freeze({ tool: 'saveCheckpoint' }),
+    restore: Object.freeze({ tool: 'restoreCheckpoint' }),
+    list: Object.freeze({ tool: 'listCheckpoints' }),
+    delete: Object.freeze({ tool: 'deleteCheckpoint' }),
+  }),
+  analyzeReplay: Object.freeze({
+    parse: Object.freeze({ tool: 'parseYrpRoute' }),
+    context: Object.freeze({ tool: 'buildRouteContext' }),
+    // analyze parses and then builds context, so its input requirements are the
+    // parse step's requirements.
+    analyze: Object.freeze({ tool: 'parseYrpRoute' }),
+  }),
+  analyzeCombo: Object.freeze({
+    parse: Object.freeze({ tool: 'parseComboArtifact' }),
+    adapt: Object.freeze({ tool: 'buildComboAdaptationContext' }),
+  }),
+  saveArtifact: Object.freeze({
+    replay: Object.freeze({ tool: 'saveReplayYrp' }),
+    route: Object.freeze({ tool: 'saveRouteFile' }),
+  }),
+  manageEngineSession: Object.freeze({
+    status: Object.freeze({ tool: 'getEngineSessionStatus' }),
+    clear: Object.freeze({ tool: 'clearEngineSession' }),
+    shutdown: Object.freeze({ tool: 'shutdownEngineHost' }),
+  }),
+});
+
 export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   queryCards: {
     type: 'object',
     properties: {
-      action: actionProperty(['get', 'search'], 'Use get for one exact card or search for a result list.'),
+      action: actionProperty(['get', 'search'], 'get: one exact card, so pass exactly one of cardName/name/id/passcode. search: a result list, so pass query.'),
       ...mergeProperties('getCardEffect', 'searchCards'),
     },
     required: ['action'],
@@ -425,7 +482,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   manageCardDataSources: {
     type: 'object',
     properties: {
-      action: actionProperty(['inspect', 'refresh'], 'Inspect local resources or refresh official resources.'),
+      action: actionProperty(['inspect', 'refresh'], 'inspect: read local resources (no extra fields). refresh: download official data, which requires allowNetworkUpdate:true.'),
       ...mergeProperties('refreshCardDataSources'),
     },
     required: ['action'],
@@ -434,7 +491,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   manageYgoPro2: {
     type: 'object',
     properties: {
-      action: actionProperty(['discover', 'status'], 'Discover installations or inspect the active duel bridge.'),
+      action: actionProperty(['discover', 'status'], 'discover: scan for local installations (optional root/scan fields). status: inspect the active bridge (no extra fields).'),
       ...mergeProperties('discoverYgoPro2'),
     },
     required: ['action'],
@@ -444,7 +501,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   manageSessionDeck: {
     type: 'object',
     properties: {
-      action: actionProperty(['set', 'get', 'check', 'edit', 'export'], 'Select the deck operation.'),
+      action: actionProperty(['set', 'get', 'check', 'edit', 'export'], 'set: one of ydk/deckText/deck. get: no extra fields. check: one of cards/cardNames/names/ids/cardIds/passcodes. edit: operation. export: optional fileName and save:true to write.'),
       ...mergeProperties('setSessionDeck', 'checkDeckCards', 'editSessionDeck', 'exportSessionDeck'),
     },
     required: ['action'],
@@ -462,18 +519,41 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   observeDuel: {
     type: 'object',
     properties: {
-      action: actionProperty(['state', 'actions'], 'Return current state or current legal actions.'),
+      action: actionProperty(['state', 'actions'], 'state: current verified state. actions: a bounded page of legal actions.'),
       ...mergeProperties('getCurrentState', 'listActions'),
     },
     required: ['action'],
     additionalProperties: false,
   },
-  executeAction: TOOL_INPUT_SCHEMAS.executeAction,
+  // executeAction keeps its root anyOf, because "one of these three selectors" is
+  // not expressible in the DSH parameter DSL (parameters are a property map with
+  // no root combinator). The engine validator enforces the anyOf; the prose on
+  // each selector is the only part the model can see, so the two must agree.
+  executeAction: {
+    type: 'object',
+    properties: {
+      ...TOOL_INPUT_SCHEMAS.executeAction.properties,
+      actionLabel: {
+        ...TOOL_INPUT_SCHEMAS.executeAction.properties.actionLabel,
+        description: 'Provide exactly one of actionLabel, actionIndex, or selectionIndexes.',
+      },
+      actionIndex: {
+        ...TOOL_INPUT_SCHEMAS.executeAction.properties.actionIndex,
+        description: 'Provide exactly one of actionLabel, actionIndex, or selectionIndexes.',
+      },
+      selectionIndexes: {
+        ...TOOL_INPUT_SCHEMAS.executeAction.properties.selectionIndexes,
+        description: 'Provide exactly one of actionLabel, actionIndex, or selectionIndexes. Original candidate indexes for a factorized multi-card selection.',
+      },
+    },
+    anyOf: TOOL_INPUT_SCHEMAS.executeAction.anyOf,
+    additionalProperties: false,
+  },
   simulateActions: TOOL_INPUT_SCHEMAS.simulateActions,
   manageCheckpoint: {
     type: 'object',
     properties: {
-      action: actionProperty(['save', 'restore', 'list', 'delete'], 'Select the checkpoint operation.'),
+      action: actionProperty(['save', 'restore', 'list', 'delete'], 'save: optional name/note. restore: id or name. list: optional includeAutomatic. delete: one of id/name/all.'),
       ...mergeProperties('saveCheckpoint', 'restoreCheckpoint', 'listCheckpoints', 'deleteCheckpoint'),
     },
     required: ['action'],
@@ -482,7 +562,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   analyzeReplay: {
     type: 'object',
     properties: {
-      action: actionProperty(['parse', 'context', 'analyze'], 'Parse only, build context only, or parse and build context.'),
+      action: actionProperty(['parse', 'context', 'analyze'], 'parse and analyze both require one of yrpBase64/file. context: build context from already-parsed replay metadata.'),
       ...mergeProperties('parseYrpRoute', 'buildRouteContext'),
     },
     required: ['action'],
@@ -491,7 +571,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   analyzeCombo: {
     type: 'object',
     properties: {
-      action: actionProperty(['parse', 'adapt'], 'Normalize an artifact or adapt it to the loaded deck.'),
+      action: actionProperty(['parse', 'adapt'], 'parse: one of artifact/json/content/text/file. adapt: compare against the deck loaded in this session.'),
       ...mergeProperties('buildComboAdaptationContext', 'parseComboArtifact'),
     },
     required: ['action'],
@@ -500,7 +580,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   saveArtifact: {
     type: 'object',
     properties: {
-      action: actionProperty(['replay', 'route'], 'Save a replay or route report.'),
+      action: actionProperty(['replay', 'route'], 'replay: save the duel replay (optional fileName/surrenderIfRunning). route: save a verified report, which requires content.'),
       ...mergeProperties('saveReplayYrp', 'saveRouteFile'),
     },
     required: ['action'],
@@ -509,7 +589,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   manageEngineSession: {
     type: 'object',
     properties: {
-      action: actionProperty(['status', 'clear', 'shutdown'], 'Inspect this session, clear it, or stop the entire engine host.'),
+      action: actionProperty(['status', 'clear', 'shutdown'], 'status: inspect this session. clear and shutdown both require confirm:true.'),
       confirm: { type: 'boolean', description: 'Must be true for clear or shutdown.' },
     },
     required: ['action'],
@@ -541,8 +621,93 @@ export function validatePublicToolInput(name, input) {
   if (!schema) {
     return { ok: false, errors: [{ path: '$', message: `No public input schema is registered for tool ${name}.` }] };
   }
+
+  // Resolve the action first so an unknown action reports INVALID_ACTION with
+  // the available list, instead of the generic enum message the action property
+  // would otherwise produce.
+  const actions = PUBLIC_TOOL_ACTIONS[name];
+  const record = asRecord(input);
+  let entry = null;
+  if (actions) {
+    entry = actions[record.action];
+    if (!entry) {
+      const available = Object.keys(actions);
+      return {
+        ok: false,
+        errors: [{
+          path: '$.action',
+          code: 'INVALID_ACTION',
+          message: `Unknown action ${JSON.stringify(record.action ?? null)} for ${name}. Expected one of: ${available.join(', ')}.`,
+          data: { availableActions: available },
+        }],
+      };
+    }
+  }
+
   const errors = validateValue(schema, input, '$');
-  return errors.length === 0 ? { ok: true, errors: [] } : { ok: false, errors };
+  if (errors.length > 0) return { ok: false, errors };
+  if (!entry) return { ok: true, errors: [] };
+
+  // The public schema intentionally allows the union of every action's
+  // properties, because a JSON Schema root-level oneOf cannot be expressed in
+  // the DSH parameter DSL (parameters are always a property map). Conditional
+  // requirements are therefore enforced here, against the internal schema of
+  // the selected action, so a missing argument fails with a precise error
+  // instead of silently reaching a tool that will reject it later.
+  const requirementErrors = validateActionRequirements(entry.tool, record);
+  return requirementErrors.length === 0 ? { ok: true, errors: [] } : { ok: false, errors: requirementErrors };
+}
+
+/**
+ * Enforce one internal tool's own `required` list and root-level `anyOf`
+ * ("at least one of") against an aggregate public input.
+ *
+ * Only these two constructs are checked: the aggregate input legitimately
+ * carries properties belonging to sibling actions, so the internal schema's
+ * `additionalProperties: false` must not be applied here.
+ *
+ * @param {string} internalName
+ * @param {Record<string, unknown>} input
+ */
+function validateActionRequirements(internalName, input) {
+  const internal = TOOL_INPUT_SCHEMAS[internalName];
+  if (!internal) return [];
+  const errors = [];
+  for (const key of Array.isArray(internal.required) ? internal.required : []) {
+    if (key === 'action') continue;
+    if (input[key] === undefined || input[key] === null) {
+      errors.push({
+        path: `$.${key}`,
+        code: 'MISSING_REQUIRED_ARGUMENT',
+        message: `${internalName} requires ${key} for this action.`,
+      });
+    }
+  }
+  if (Array.isArray(internal.anyOf) && internal.anyOf.length > 0) {
+    const satisfied = internal.anyOf.some((branch) => {
+      const required = Array.isArray(asRecord(branch).required) ? asRecord(branch).required : null;
+      if (required) return required.every((key) => input[key] !== undefined && input[key] !== null);
+      return validateValue(branch, input, '$').length === 0;
+    });
+    if (!satisfied) {
+      const alternatives = [...new Set(internal.anyOf
+        .flatMap((branch) => Array.isArray(asRecord(branch).required) ? asRecord(branch).required : [])
+        .filter((entry) => typeof entry === 'string'))];
+      errors.push({
+        path: '$',
+        code: 'MISSING_REQUIRED_ARGUMENT',
+        message: alternatives.length > 0
+          ? `${internalName} requires at least one of: ${alternatives.join(', ')}.`
+          : `${internalName} received arguments that match none of its accepted shapes.`,
+        data: { alternatives },
+      });
+    }
+  }
+  return errors;
+}
+
+export function validateSchemaValue(schemaValue, value, path = '$') {
+  return validateValue(schemaValue, value, path);
 }
 
 function validateValue(schemaValue, value, path) {
@@ -563,6 +728,22 @@ function validateValue(schemaValue, value, path) {
           : 'Value does not match any allowed schema.',
       });
     }
+  }
+
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+    const matches = schema.oneOf.filter((candidate) => validateValue(candidate, value, path).length === 0);
+    if (matches.length !== 1) {
+      errors.push({
+        path,
+        message: matches.length === 0
+          ? 'Value does not match any allowed variant.'
+          : `Value matches ${matches.length} variants, but exactly one is required.`,
+      });
+    }
+  }
+
+  if (Object.hasOwn(schema, 'const') && !Object.is(value, schema.const)) {
+    errors.push({ path, message: `Expected the literal value ${JSON.stringify(schema.const)}.` });
   }
 
   const required = Array.isArray(schema.required) ? schema.required : [];
@@ -609,6 +790,15 @@ function validateValue(schemaValue, value, path) {
     }
     if (Number.isFinite(schema.maxLength) && value.length > schema.maxLength) {
       errors.push({ path, message: `Expected at most ${schema.maxLength} character(s).` });
+    }
+    if (typeof schema.pattern === 'string') {
+      let matches = true;
+      try {
+        matches = new RegExp(schema.pattern).test(value);
+      } catch {
+        matches = true;
+      }
+      if (!matches) errors.push({ path, message: `Expected a value matching ${schema.pattern}.` });
     }
   } else if (schema.type === 'integer' || schema.type === 'number') {
     if (typeof value !== 'number' || !Number.isFinite(value)) {

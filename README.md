@@ -23,8 +23,10 @@ YGO Tools for DSH 是一个面向 DeepSeek Harness 的原生游戏王工具插�
 从 GitHub Release 安装插件：
 
 ```powershell
-dsh plugin --profile web add "https://github.com/mellfy-puppy/ygo-tools-for-dsh/releases/download/v1.2.0/ygo-tools-for-dsh-1.2.0.tgz"
+dsh plugin --profile web add "https://github.com/mellfy-puppy/ygo-tools-for-dsh/releases/latest/download/ygo-tools-for-dsh.tgz"
 ```
+
+Release 页面同时提供带版本号的文件名与 `SHA256SUMS.txt`，需要固定版本时按需替换。
 
 然后在预设的 `agent.cordis.yml` 中挂载：
 
