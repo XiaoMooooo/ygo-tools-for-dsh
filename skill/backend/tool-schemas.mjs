@@ -45,6 +45,7 @@ export const TOOL_DESCRIPTIONS = Object.freeze({
   listActions: 'Return a compact bounded page of current legal actions, optionally filtered by category, with factorized-selection constraints when a full combination set would be too large.',
   executeAction: 'Execute one current legal action and return the updated state plus next legal actions so another state/action fetch is normally unnecessary.',
   simulateActions: 'Simulate a short legal action sequence and restore the original live state afterward.',
+  expandCombo: 'Search engine-verified combo routes for the loaded deck and return ranked action lines, instead of stepping one action per call.',
   saveCheckpoint: 'Save the current live runner state as an in-memory checkpoint.',
   restoreCheckpoint: 'Restore an in-memory checkpoint by id, name, or latest checkpoint.',
   listCheckpoints: 'List in-memory checkpoint summaries for the current session.',
@@ -261,6 +262,20 @@ export const TOOL_INPUT_SCHEMAS = Object.freeze({
     required: ['actionLabels'],
     additionalProperties: false,
   },
+  expandCombo: {
+    type: 'object',
+    properties: {
+      ydk: { type: 'string', minLength: 1 },
+      openingCodes: { type: 'array', items: { type: 'integer', minimum: 1 }, maxItems: 10 },
+      seed: { type: 'integer', minimum: 0 },
+      drawCount: { type: 'integer', minimum: 1 },
+      maxNodes: { type: 'integer', minimum: 1 },
+      maxDepth: { type: 'integer', minimum: 1 },
+      topK: { type: 'integer', minimum: 1 },
+      diversityCap: { type: 'integer', minimum: 0 },
+    },
+    additionalProperties: false,
+  },
   saveCheckpoint: {
     type: 'object',
     properties: {
@@ -405,6 +420,7 @@ export const PUBLIC_TOOL_DESCRIPTIONS = Object.freeze({
   observeDuel: 'Return the verified current duel state or a bounded page of current legal actions.',
   executeAction: TOOL_DESCRIPTIONS.executeAction,
   simulateActions: TOOL_DESCRIPTIONS.simulateActions,
+  expandCombo: TOOL_DESCRIPTIONS.expandCombo,
   manageCheckpoint: 'Save, restore, list, or delete in-memory checkpoints for embedded-runner branch exploration.',
   analyzeReplay: 'Parse replay bytes or a replay file, build model-readable route context, or do both in one call.',
   analyzeCombo: 'Normalize a combo artifact or adapt it against the deck loaded in the current session.',
@@ -550,6 +566,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
     additionalProperties: false,
   },
   simulateActions: TOOL_INPUT_SCHEMAS.simulateActions,
+  expandCombo: TOOL_INPUT_SCHEMAS.expandCombo,
   manageCheckpoint: {
     type: 'object',
     properties: {

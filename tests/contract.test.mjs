@@ -41,7 +41,7 @@ const actionless = PUBLIC_TOOL_NAMES.filter((n) => !PUBLIC_TOOL_INPUT_SCHEMAS[n]
 t.check('actionless tools are absent from the table',
   actionless.filter((n) => PUBLIC_TOOL_ACTIONS[n]).length, 0);
 t.note(`actionless public tools: ${JSON.stringify(actionless)}`);
-t.check('the public surface still exposes 14 tools', PUBLIC_TOOL_NAMES.length, 14);
+t.check('the public surface exposes 15 tools', PUBLIC_TOOL_NAMES.length, 15);
 
 t.section('unknown actions are refused with the available list');
 for (const [tool, input] of [['queryCards', { action: 'lookup' }], ['manageEngineSession', { action: 'statu' }], ['observeDuel', {}]]) {

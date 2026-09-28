@@ -50,7 +50,23 @@ jobs:
           cp dist/ygo-tools-for-dsh-*.tgz dist/ygo-tools-for-dsh.tgz
       - name: Write checksums
         run: cd dist && sha256sum *.tgz > SHA256SUMS.txt
+      - name: Write release notes from the changelog
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # Everything between "## <tag>" and the next "## " heading becomes the
+          # release body, so the notes live in exactly one place: CHANGELOG.md.
+          awk -v pattern="^## ${tag}" '
+            $0 ~ pattern {capture=1; next}
+            capture && /^## / {exit}
+            capture {print}
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "See CHANGELOG.md for details." > release-notes.md
+          fi
+          cat release-notes.md
       - name: Upload tarball to release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: release-notes.md

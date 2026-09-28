@@ -1,11 +1,11 @@
 ---
 name: ygo-tools-for-dsh
-description: 游戏王专用技能：通过 14 个聚合式 YGO 工具完成卡查、卡组管理、持久引擎对局、固定起手、检查点、YGOPro2 AI.Server 对战与录像分析导出。普通工作纯内存，不创建脚本、报告或日志。
+description: 游戏王专用技能：通过 15 个聚合式 YGO 工具完成卡查、卡组管理、持久引擎对局、固定起手、检查点、展开路线搜索、YGOPro2 AI.Server 对战与录像分析导出。普通工作纯内存，不创建脚本、报告或日志。
 ---
 
 # YGO 对战引擎工作方式
 
-本预设挂载 `ygo-tools-for-dsh`，只向模型注册 14 个聚合式 YGO
+本预设挂载 `ygo-tools-for-dsh`，只向模型注册 15 个聚合式 YGO
 工具。引擎首次调用时自动启动并跨 DSH 重启保留。模型不得经 shell、
 eval、Node import、HTTP、CLI 或包装脚本调用后端。
 
@@ -24,7 +24,7 @@ eval、Node import、HTTP、CLI 或包装脚本调用后端。
 6. 只有 DSH 直接报 `manageEngineSession` 未知才证明插件注册失败；此时
    停止并报告，绝不自建后端访问路径。
 
-## 14 个公开工具
+## 15 个公开工具
 
 - `queryCards`: `get` / `search`
 - `manageCardDataSources`: `inspect` / `refresh`
@@ -35,6 +35,7 @@ eval、Node import、HTTP、CLI 或包装脚本调用后端。
 - `observeDuel`: `state` / `actions`
 - `executeAction`
 - `simulateActions`
+- `expandCombo`: 让引擎自己搜索展开路线，返回 top-K 条带评分的动作序列
 - `manageCheckpoint`: `save` / `restore` / `list` / `delete`
 - `analyzeReplay`: `parse` / `context` / `analyze`
 - `analyzeCombo`: `parse` / `adapt`

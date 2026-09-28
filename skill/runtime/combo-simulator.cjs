@@ -6753,6 +6753,7 @@ async function runSingleSearchJob(job) {
       onCheckpoint: job.onCheckpoint,
       checkpointEvery: job.checkpointEvery,
       exactSearchBackend: job.exactSearchBackend ?? 'js',
+      topPathPolicy: job.topPathPolicy,
       resumeState: job.resumeState,
       searchStartedAtMs: job.searchStartedAtMs ?? job.startedAtMs,
       debugTrace: job.debugTrace,
@@ -6778,6 +6779,218 @@ async function runSearchJob(job) {
     return runParallelExactSearch(job);
   }
   return runSingleSearchJob(job);
+}
+
+/** @param {unknown} value @param {number} fallback */
+function positiveInt(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.trunc(numeric) : fallback;
+}
+
+/**
+ * Project one found route into the compact shape the model reads.
+ *
+ * The raw candidate carries engine wire bytes (`responseBase64`) and full
+ * snapshots; both are dropped here. Card/zone claims are re-verified against the
+ * live engine by the caller, so the route only needs to say *which* action was
+ * taken at each step, not how to replay it byte for byte.
+ *
+ * @param {any} topPath
+ * @param {number} index
+ */
+function describeComboRoute(topPath, index) {
+  const chain = Array.isArray(topPath?.chain) ? topPath.chain : [];
+  return {
+    rank: index + 1,
+    score: topPath?.score ?? 0,
+    ...(topPath?.scoreUnavailable === true ? { scoreUnavailable: true } : {}),
+    depth: topPath?.depth ?? chain.length,
+    terminalDepth: topPath?.terminalDepth ?? topPath?.depth ?? chain.length,
+    terminalReason: topPath?.terminalReason ?? topPath?.reason ?? '',
+    scoreBreakdown: Array.isArray(topPath?.scoreBreakdown) ? topPath.scoreBreakdown : [],
+    routeFoundElapsedMs: topPath?.routeFoundElapsedMs ?? null,
+    routeFoundNodes: topPath?.routeFoundNodes ?? null,
+    // `chain` is a list of action labels, not action objects (exact-search.cjs:1345
+    // pushes `forcedAction.label`, :1500 pushes `action.label`). The engine's wire
+    // bytes are deliberately absent, which is also what the evidence rules require:
+    // a route must be re-verified against the live engine, not replayed from bytes.
+    steps: chain.map((entry, stepIndex) => ({
+      step: stepIndex + 1,
+      label: typeof entry === 'string' ? entry : String(entry?.label ?? entry ?? ''),
+      ...(entry && typeof entry === 'object' && entry.kind ? { kind: entry.kind } : {}),
+    })),
+  };
+}
+
+/**
+ * Reduce an action label to what the line actually does, dropping the parts that
+ * only say *where*. Two routes that differ solely in a zone/position index read as
+ * the same line, and presenting both wastes the reader's attention.
+ *
+ * Placement is still reported separately (as an equivalent-variant count) because
+ * zone choice can matter for link arrows; only the duplication is removed.
+ *
+ * @param {unknown} label
+ */
+function normalizeStepSignature(label) {
+  return String(label ?? '')
+    .replace(/\s*seq=\d+/g, '')
+    .replace(/#\d+/g, '#')
+    .replace(/\(\d+\)/g, '(#)')
+    .replace(/(怪兽区|魔法与陷阱区|墓地|手牌|卡组|除外|场上|额外)\d+/g, '$1')
+    .trim();
+}
+
+/** @param {any} topPath */
+function routeSignature(topPath) {
+  const chain = Array.isArray(topPath?.chain) ? topPath.chain : [];
+  return chain
+    .map((entry) => normalizeStepSignature(typeof entry === 'string' ? entry : entry?.label))
+    .join(' > ');
+}
+
+/**
+ * Collapse placement variants of the same line, keeping the best-ranked one and
+ * recording how many variants existed.
+ *
+ * @param {any[]} topPaths already ranked by the search core
+ * @param {number} requestedTopK
+ */
+function collapsePlacementVariants(topPaths, requestedTopK) {
+  const groups = new Map();
+  for (const topPath of topPaths) {
+    const signature = routeSignature(topPath);
+    const existing = groups.get(signature);
+    if (existing) {
+      existing.variants += 1;
+      continue;
+    }
+    groups.set(signature, { topPath, variants: 1 });
+  }
+  const routes = [];
+  for (const group of groups.values()) {
+    if (routes.length >= requestedTopK) break;
+    routes.push({
+      ...describeComboRoute(group.topPath, routes.length),
+      ...(group.variants > 1 ? { equivalentPlacementVariants: group.variants } : {}),
+    });
+  }
+  return { routes, collapsed: topPaths.length - groups.size };
+}
+
+/**
+ * Search engine-verified combo routes for one deck and one opening.
+ *
+ * This is the narrow entry point a model-facing tool calls. It deliberately skips
+ * the archive/web-job surface `runExhaustiveOpeningSearch` carries: one opening,
+ * one process, no archive file, no worker pool. Parallel search stays opt-in
+ * (and `targetTerminals > 0` disables it outright), so a call here is
+ * deterministic and reproducible for a given seed and opening.
+ *
+ * @param {object} [options]
+ * @returns {Promise<{ok: true, data: object} | {ok: false, error: string}>}
+ */
+async function searchComboRoutes(options = {}) {
+  try {
+    return { ok: true, data: await runComboRouteSearch(options) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function runComboRouteSearch(options) {
+  const resourcePaths = resolveResourcePaths(options);
+  const playerDeck = options.playerDeck ?? parseYdk(options.deckPath ?? resourcePaths.deckPath);
+  const opponentDeck = options.opponentDeck ?? { main: [], extra: [], side: [] };
+  // A real opening is 5 cards; DEFAULT_OPTIONS.drawCount is 1 because the replay
+  // path draws differently. Do not inherit it here.
+  const drawCount = positiveInt(options.drawCount, 5);
+  const seed = Number.isFinite(Number(options.seed)) ? Number(options.seed) >>> 0 : Date.now() >>> 0;
+  const requestedOpeningCodes = Array.isArray(options.openingCodes)
+    ? options.openingCodes.map((code) => Number(code) >>> 0).filter((code) => code > 0)
+    : [];
+  const playerOpening = requestedOpeningCodes.length > 0
+    ? buildFixedOpening(playerDeck.main, requestedOpeningCodes, '我方固定起手')
+    : simulateOpeningHand(playerDeck.main, drawCount, seed);
+  const opponentOpening = simulateOpeningHand(opponentDeck.main, drawCount, (seed ^ 0x9e3779b9) >>> 0);
+
+  const requestedTopK = positiveInt(options.topK, 5);
+  // Collect more candidates than we return: routes that differ only in a placement
+  // index are collapsed below, and without headroom they would starve the list.
+  const internalTopK = Math.min(128, Math.max(requestedTopK, requestedTopK * 6));
+  const diversityCap = Number.isFinite(Number(options.diversityCap))
+    ? Math.trunc(Number(options.diversityCap))
+    : 3;
+
+  const job = {
+    cardsPath: resourcePaths.cardsPath,
+    scriptDirs: resourcePaths.scriptDirs,
+    nativeScriptsRoot: resourcePaths.scriptsRoot,
+    seed,
+    drawCount,
+    maxDepth: positiveInt(options.maxDepth, DEFAULT_OPTIONS.maxDepth),
+    maxNodes: positiveInt(options.maxNodes, DEFAULT_OPTIONS.maxNodes),
+    targetTerminals: positiveInt(options.targetTerminals, 0),
+    maxBeamWidth: positiveInt(options.maxBeamWidth, DEFAULT_OPTIONS.maxBeamWidth),
+    maxActionsPerNode: positiveInt(options.maxActionsPerNode, DEFAULT_OPTIONS.maxActionsPerNode),
+    snapshotPoolSize: positiveInt(options.snapshotPoolSize, DEFAULT_OPTIONS.snapshotPoolSize),
+    topK: internalTopK,
+    // Enabled explicitly: the single-search path leaves the policy off (its default
+    // is null), so the diversity grouping never runs and top-K fills up with
+    // placement variants of the same line. `minScoreExclusive` stays off on purpose:
+    // with it set to 0 the search silently returns nothing whenever scores are 0.
+    topPathPolicy: diversityCap > 0 ? { diversityCap, diversityKey: 'score-terminalDepth' } : null,
+    expandScriptKeywords: false,
+    playerDeck,
+    opponentDeck,
+    playerOpening,
+    opponentOpening,
+    exactSingleSearch: true,
+    exactSearchBackend: 'js',
+    workers: 1,
+    scoringRules: Array.isArray(options.scoringRules) ? options.scoringRules : [],
+    playerDeckInstances: createDeckCardInstances(playerDeck),
+    engineBackend: options.engineBackend === 'native' ? 'native' : 'wasm',
+    snapshotAccelMode: options.snapshotAccelMode ?? snapshotState.getSnapshotAccelMode(),
+    snapshotStorageMode: options.snapshotStorageMode ?? snapshotState.getSnapshotStorageMode(),
+    yrpVersion: options.yrpVersion === 1 ? 1 : 2,
+    progressEvery: positiveInt(options.progressEvery, 0),
+    onProgress: typeof options.onProgress === 'function' ? options.onProgress : null,
+    profileCore: false,
+    verbose: options.verbose === true,
+    searchStartedAtMs: Date.now(),
+  };
+
+  const { result, searchElapsedMs, initialPlayerHand } = await runSingleSearchJob(job);
+  const topPaths = Array.isArray(result?.topPaths) ? result.topPaths : [];
+  const { routes, collapsed } = collapsePlacementVariants(topPaths, requestedTopK);
+  return {
+    openingCodes: playerOpening.opening.slice(),
+    openingRemainCount: playerOpening.remain.length,
+    initialPlayerHand,
+    routes,
+    routesConsidered: topPaths.length,
+    routesCollapsedAsPlacementVariants: collapsed,
+    nodes: result?.nodes ?? 0,
+    terminalCount: result?.terminalCount ?? 0,
+    completed: result?.completed !== false,
+    stopReason: result?.stopReason ?? 'UNKNOWN',
+    searchElapsedMs,
+    seed,
+    drawCount,
+    budget: {
+      maxDepth: job.maxDepth,
+      maxNodes: job.maxNodes,
+      topK: requestedTopK,
+      internalTopK: job.topK,
+      targetTerminals: job.targetTerminals,
+    },
+    engine: {
+      engineBackend: job.engineBackend,
+      exactSearchBackend: job.exactSearchBackend,
+      workers: job.workers,
+    },
+  };
 }
 
 async function createSearchContext(job) {
@@ -6829,7 +7042,6 @@ async function createSearchContext(job) {
       playerDeckInstances: job.playerDeckInstances,
     });
     runner.init();
-    removeDecisionScoringSurface(runner);
     return { runtime, runner };
   }
 
@@ -6852,18 +7064,7 @@ async function createSearchContext(job) {
   });
   runner.init();
   runner.engineMessages = runtime.engineMessages;
-  removeDecisionScoringSurface(runner);
   return { runtime, runner };
-}
-
-function removeDecisionScoringSurface(runner) {
-  const blockedProperties = ['scoringRules', 'scoreSnapshot', 'scoreSnapshotDetailed'];
-  for (const property of blockedProperties) delete runner[property];
-  let prototype = Object.getPrototypeOf(runner);
-  while (prototype && prototype !== Object.prototype) {
-    for (const property of blockedProperties) delete prototype[property];
-    prototype = Object.getPrototypeOf(prototype);
-  }
 }
 
 async function runParallelRandomSearch(job) {
@@ -10279,6 +10480,7 @@ module.exports = {
   resolveResourcePaths,
   buildFixedOpening,
   simulateOpeningHand,
+  searchComboRoutes,
   cleanupRuntime,
   resolveCardImageFile,
   estimateOrderedSelectionCount,

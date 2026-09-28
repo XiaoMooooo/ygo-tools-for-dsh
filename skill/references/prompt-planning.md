@@ -13,6 +13,10 @@ to mutate a live runner state.
    route resource.
 4. Identify the main candidate branches from tool evidence instead of semantic
    association. Narrow the set, but keep enough alternatives for real comparison.
+   Use `expandCombo` to have the engine enumerate verified routes for the loaded
+   deck, and read the returned lines instead of discovering them one action at a
+   time. A searched line is `simulated`, not executed state: re-run its steps with
+   `executeAction` before reporting any of them as done.
 5. Use `simulateActions` for short uncertain sequences and checkpoints for live
    branch exploration.
 6. Execute the best verified branch step by step. Each successful

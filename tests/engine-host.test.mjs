@@ -85,7 +85,7 @@ const call = async (name, input) => {
   return raw?.result ?? raw;
 };
 
-t.check('the client discovers the 14 public tools', (await client.listTools()).length, 14);
+t.check('the client discovers the 15 public tools', (await client.listTools()).length, 15);
 t.check('the client resolves an auth token', client.hasToken, true);
 
 const noIdentifier = await call('queryCards', { action: 'get' });

@@ -1,6 +1,6 @@
 # YGO Tool Guide
 
-Use only the 14 YGO tools registered by the DeepSeek Harness plugin. Do not
+Use only the 15 YGO tools registered by the DeepSeek Harness plugin. Do not
 invoke backend modules, HTTP endpoints, shell commands, or temporary scripts
 during model decision work.
 
@@ -28,6 +28,8 @@ actions `clear` or `shutdown` with `confirm:true` only for explicit teardown.
 - `executeAction`: execute one legal action and return synchronized state and
   the next decision.
 - `simulateActions`: compare a short embedded continuation without committing.
+- `expandCombo`: search engine-verified combo routes for the loaded deck and get
+  ranked action lines with scores, instead of stepping one action per call.
 - `manageCheckpoint`: actions `save`, `restore`, `list`, and `delete`.
 - `analyzeReplay`: actions `parse`, `context`, and `analyze`; `analyze` parses
   and builds model-readable context in one call.

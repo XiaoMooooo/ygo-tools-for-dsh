@@ -33,6 +33,9 @@ const CORE_MODULES = Object.freeze({
   routeValidation: 'src/tools/route-validation.js',
   runnerFactory: 'src/runner/factory.js',
   yrpRouteEngine: 'src/replay/yrp-route-engine.js',
+  // CommonJS runtime module: read `searchComboRoutes` off `default` when the ESM
+  // interop does not surface it as a named export.
+  comboSimulator: 'combo-simulator.cjs',
 });
 
 const CURRENT_DUEL_RULE = 5;
@@ -59,6 +62,7 @@ const CORE_TOOL_NAMES = Object.freeze([
   'listActions',
   'executeAction',
   'simulateActions',
+  'expandCombo',
   'saveCheckpoint',
   'restoreCheckpoint',
   'listCheckpoints',
@@ -280,6 +284,8 @@ async function executeCoreTool(name, config, moduleCache, context, input) {
     case 'simulateActions':
       if (isYgoPro2DuelRunner(resolveRunner(context))) return unsupportedExternalDuelTool(name);
       return executeNamedExport(config, moduleCache, 'actionTools', name, context, input);
+    case 'expandCombo':
+      return expandComboRoutes(context, input, config, moduleCache);
     case 'saveCheckpoint':
     case 'restoreCheckpoint':
     case 'listCheckpoints':
@@ -821,6 +827,67 @@ async function setSessionDeck(context, input, config, moduleCache) {
   } finally {
     cardsDb.close?.();
   }
+}
+
+/**
+ * Hand deck-level branch exploration to the engine's own search instead of making
+ * the caller drive one action per tool call. Read-only: it builds its own search
+ * context and never touches the live session runner, so it cannot corrupt an
+ * in-progress route.
+ */
+async function expandComboRoutes(context, input, config, moduleCache) {
+  const record = asRecord(input);
+  const session = requireSession(context, 'expandCombo');
+  const sessionDeck = readSessionDeck(session);
+  const ydkText = readString(record.ydk) ?? readString(record.deckYdk);
+  if (!sessionDeck && !ydkText) {
+    return {
+      ok: false,
+      code: 'NO_DECK',
+      error: 'No deck is loaded for this session. Load one with manageSessionDeck({action:"set"}) first, or pass ydk text.',
+    };
+  }
+
+  const module = await loadCoreModule(config, moduleCache, 'comboSimulator');
+  const api = module.default ?? module;
+  const searchComboRoutes = api.searchComboRoutes;
+  if (typeof searchComboRoutes !== 'function') {
+    return { ok: false, code: 'SEARCH_UNAVAILABLE', error: 'combo-simulator.searchComboRoutes is not available.' };
+  }
+
+  let playerDeck = sessionDeck;
+  if (!playerDeck) {
+    if (typeof api.parseYdkText !== 'function') {
+      return { ok: false, code: 'SEARCH_UNAVAILABLE', error: 'combo-simulator.parseYdkText is not available.' };
+    }
+    playerDeck = api.parseYdkText(ydkText);
+  }
+
+  const result = await searchComboRoutes({
+    playerDeck,
+    openingCodes: Array.isArray(record.openingCodes)
+      ? record.openingCodes.map((value) => Number(value) >>> 0).filter((value) => value > 0)
+      : [],
+    seed: record.seed === undefined ? undefined : Number(record.seed) >>> 0,
+    drawCount: record.drawCount,
+    maxNodes: record.maxNodes,
+    maxDepth: record.maxDepth,
+    topK: record.topK,
+    diversityCap: record.diversityCap,
+    cardsPath: config.cardsDbPath,
+  });
+  if (result?.ok !== true) {
+    return { ok: false, code: 'SEARCH_FAILED', error: readString(result?.error) ?? 'combo search failed' };
+  }
+  return {
+    ok: true,
+    data: {
+      action: 'expandCombo',
+      deckSource: sessionDeck ? 'session' : 'ydk',
+      deckName: readString(session.metadata.currentDeckName) ?? null,
+      ...result.data,
+    },
+  };
 }
 
 function getSessionDeck(context) {
