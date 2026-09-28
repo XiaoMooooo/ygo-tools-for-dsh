@@ -28,6 +28,18 @@ dsh plugin --profile desktop add "https://github.com/XiaoMooooo/ygo-tools-for-ds
 
 Release 页面同时提供带版本号的文件名与 `SHA256SUMS.txt`，需要固定版本时按需替换。
 
+**升级请改用带版本号的地址：**
+
+```powershell
+dsh plugin --profile desktop add "https://github.com/XiaoMooooo/ygo-tools-for-dsh/releases/download/v1.2.2/ygo-tools-for-dsh-1.2.2.tgz"
+```
+
+`releases/latest/download/` 是稳定别名，它的**字节会随每次发版变化**，而包管理器按内容哈希校验依赖，
+沿用该地址升级会因 integrity 不匹配被拒绝（提示 `pnpm store prune` 或 `--update-checksums`）。
+带版本号的地址内容唯一，升级路径才可靠；`SHA256SUMS.txt` 可用于核对下载内容。
+
+安装或升级后需要**重启 DSH**，插件在启动时载入，替换 `node_modules` 不会热更新运行中的进程。
+
 然后在预设的 `agent.cordis.yml` 中挂载：
 
 ```yaml
@@ -93,6 +105,7 @@ Release 页面同时提供带版本号的文件名与 `SHA256SUMS.txt`，需要�
 | **卡片** | `queryCards` · `manageCardDataSources` · `getBanlistContext` |
 | **卡组** | `manageSessionDeck` |
 | **决斗** | `resetGame` · `observeDuel` · `executeAction` · `simulateActions` |
+| **展开** | `expandCombo` |
 | **状态** | `manageCheckpoint` · `manageEngineSession` |
 | **分析** | `analyzeCombo` · `analyzeReplay` · `saveArtifact` |
 | **桥接** | `manageYgoPro2` |
