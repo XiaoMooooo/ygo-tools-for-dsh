@@ -23,7 +23,7 @@ YGO Tools for DSH 是一个面向 DeepSeek Harness 的原生游戏王工具插�
 从 GitHub Release 安装插件：
 
 ```powershell
-dsh plugin --profile web add "https://github.com/mellfy-puppy/ygo-tools-for-dsh/releases/latest/download/ygo-tools-for-dsh.tgz"
+dsh plugin --profile desktop add "https://github.com/XiaoMooooo/ygo-tools-for-dsh/releases/latest/download/ygo-tools-for-dsh.tgz"
 ```
 
 Release 页面同时提供带版本号的文件名与 `SHA256SUMS.txt`，需要固定版本时按需替换。
