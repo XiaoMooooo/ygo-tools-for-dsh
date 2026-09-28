@@ -17,7 +17,6 @@
 <br>
 
 YGO Tools for DSH 是一个面向 DeepSeek Harness 的原生游戏王工具插件。它把卡片数据、禁限表、卡组管理和 OCG 规则引擎接入模型，使游戏王研究从文本查询进入可验证的决斗状态。
-fork自https://github.com/mellfy-puppy/ygo-tools-for-dsh
 
 ## 快速开始
 
