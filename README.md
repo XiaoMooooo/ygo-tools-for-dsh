@@ -134,8 +134,18 @@ skill/references/     数据来源与研究规则
 skill/vendor/         随包提供的运行依赖
 ```
 
-## 许可
+## 许可与第三方声明
 
-[0BSD](./LICENSE)
+| 范围 | 许可 | 说明 |
+| :--- | :--- | :--- |
+| 本仓库原创代码 | [0BSD](./LICENSE) | 零条件许可，不要求署名或保留声明 |
+| `skill/vendor/node_modules/` 内的第三方组件 | 各自原始许可（MIT / ISC / BSD-3-Clause / Zlib 等） | 不由本项目重新授权 |
+| `skill/resources/` 的游戏数据与卡牌脚本 | 不属于本项目，亦不在上述开源许可覆盖范围内 | 见下方声明 |
 
-卡片数据库、禁限表、卡片脚本及其他数据资源遵循各自上游项目的许可与分发条款。
+分发物中包含的第三方组件清单、各自许可文本、以及游戏数据与卡牌脚本的来源声明，
+见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
+
+卡片数据库、禁限表、卡片脚本及其他数据资源，著作权归其各自权利人所有。本项目不主张任何权利，
+仅在运行所必需时随工具一并分发；使用者应自行确认在其所在法域内的使用与再分发是否适当。
+
+本项目是 [`mellfy-puppy/ygo-tools-for-dsh`](https://github.com/mellfy-puppy/ygo-tools-for-dsh) 的 fork，上游同样采用 0BSD。
