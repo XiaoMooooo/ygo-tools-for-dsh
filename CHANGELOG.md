@@ -6,6 +6,7 @@
 - **新增 `expandCombo` 工具**：让引擎自己搜索展开路线并返回 top-K 条带评分的动作序列，替代逐步试探的多次往返。新增 `combo-simulator.searchComboRoutes` 作为窄入口（单起手、单进程、无归档），并抑制 top-K 中「只差区域序号」的重复路线（透传 `topPathPolicy` + 按动作序列去重，同时报告等价放置变体数量）。
 - 公开工具数 14 → 15；`lib/dsh-skill.md`、`skill/references/backend-commands.md`、`skill/references/prompt-planning.md` 与两处测试断言已同步。
 - 文档与元数据：README 的安装命令改为指向本仓库与 `desktop` profile（原先指向上游与 `web` profile）；`package.json` 补上 `repository` / `homepage` / `bugs`，`skill/package.json` 补 `repository` 并标注 `directory: skill`。
+- **发布物补充（同日重发）**：追加 `THIRD-PARTY-NOTICES.md`（26 个随包第三方组件、各自许可文本、游戏数据与脚本来源声明），并修复 `files` 中误删许可文件的四条排除规则。随包许可/声明文件 22 → 29 个，发布物体积 14.37 → 14.45 MB。
 
 ## 1.2.1 — 2026-09-28
 
