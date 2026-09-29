@@ -27,6 +27,9 @@ export function createPersistentEngineServer(options = {}) {
   let closing = false;
   let server;
   const host = createModelToolHost(options.backendConfig ?? {}, {
+    // The host reports this address in `manageEngineSession` diagnostics, so it
+    // must be the address it actually listens on (not an environment default).
+    engineHost: { hostname, port },
     onShutdown() {
       closing = true;
       // Release every session (duel runners, YGOPro2 temp directories) before

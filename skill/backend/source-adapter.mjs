@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -44,6 +45,23 @@ const CURRENT_DUEL_RULE = 5;
 const CURRENT_DUEL_OPTIONS = CURRENT_DUEL_RULE << 16;
 const MIN_REPLAY_OPPONENT_MAIN_DECK_SIZE = 40;
 const MAX_ROUTE_CONTENT_LENGTH = 200000;
+
+// A wall-clock slice for `expandCombo`. The engine search costs roughly 20 ms per
+// node, so an unbounded `maxNodes: 6000` call ran for minutes inside the process
+// that serves every other tool call and took the whole session's YGO tools down
+// with it. 15 s keeps a single call inside a human-scale wait; the 60 s cap is the
+// backstop, since the transport still cannot interrupt a call already in flight.
+// Exported so the resolved-budget rules can be asserted without waiting a minute.
+export const DEFAULT_COMBO_TIME_SLICE_MS = 15000;
+export const MAX_COMBO_TIME_SLICE_MS = 60000;
+// How often the search hands the event loop back inside a slice. Each node is
+// expensive, so this is a responsiveness knob, not a throughput one.
+const COMBO_YIELD_EVERY_NODES = 64;
+// Bounded job store. One entry holds a serialized DFS stack (root state plus every
+// pending frame), so an unbounded map would grow with the session; keeping only
+// the most recent jobs is what stops a long-lived host from accumulating them.
+const DEFAULT_COMBO_JOB_CAP = 8;
+const MAX_COMBO_JOB_CAP = 64;
 
 const CORE_TOOL_NAMES = Object.freeze([
   'getCardEffect',
@@ -835,10 +853,62 @@ async function setSessionDeck(context, input, config, moduleCache) {
 }
 
 /**
+ * Bounded store for `expandCombo` continuation handles.
+ *
+ * The engine's `resumeState` serializes the whole DFS stack, so it must never
+ * travel in the model payload and must never accumulate for the life of the host.
+ * Keys are job ids generated here; values are the opaque resume payloads. Insertion
+ * order is Map order, and every write re-inserts, so the oldest entry is always
+ * first — eviction is therefore "drop the first key".
+ */
+const comboSearchJobs = new Map();
+
+function comboJobCap() {
+  const parsed = Number(process.env.YGO_COMBO_JOB_CAP);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_COMBO_JOB_CAP;
+  return Math.min(Math.trunc(parsed), MAX_COMBO_JOB_CAP);
+}
+
+function dropComboSearchJob(jobId) {
+  return comboSearchJobs.delete(jobId);
+}
+
+function putComboSearchJob(jobId, job) {
+  // Re-insert so the most recently continued job is the last one evicted.
+  comboSearchJobs.delete(jobId);
+  comboSearchJobs.set(jobId, job);
+  const cap = comboJobCap();
+  while (comboSearchJobs.size > cap) {
+    const oldest = comboSearchJobs.keys().next();
+    if (oldest.done) break;
+    comboSearchJobs.delete(oldest.value);
+  }
+  return comboSearchJobs.size;
+}
+
+function takeComboSearchJob(jobId) {
+  const job = comboSearchJobs.get(jobId);
+  if (!job) return null;
+  putComboSearchJob(jobId, job);
+  return job;
+}
+
+export function resolveComboTimeSliceMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_COMBO_TIME_SLICE_MS;
+  return Math.min(Math.trunc(parsed), MAX_COMBO_TIME_SLICE_MS);
+}
+
+/**
  * Hand deck-level branch exploration to the engine's own search instead of making
  * the caller drive one action per tool call. Read-only: it builds its own search
  * context and never touches the live session runner, so it cannot corrupt an
  * in-progress route.
+ *
+ * The search is bounded by a wall-clock slice and resumable. A slice that runs out
+ * stops the DFS at a frame boundary, the host parks the engine's `resumeState`
+ * under a job id, and the model only ever sees `{ jobId, resumable, ... }`. Passing
+ * that job id back continues from where the slice stopped instead of restarting.
  */
 async function expandComboRoutes(context, input, config, moduleCache) {
   const record = asRecord(input);
@@ -850,6 +920,45 @@ async function expandComboRoutes(context, input, config, moduleCache) {
       ok: false,
       code: 'NO_DECK',
       error: 'No deck is loaded for this session. Load one with manageSessionDeck({action:"set"}) first, or pass ydk text.',
+    };
+  }
+
+  const requestedJobId = readString(record.jobId);
+  // `cancel` (or an explicit `jobId: null`) is how a caller drops a job it is done
+  // with, so a host that never dies does not keep the stack alive forever.
+  if (record.cancel === true || record.jobId === null) {
+    if (!requestedJobId) return { ok: true, data: { action: 'expandCombo', cancelled: false, droppedJob: null } };
+    const dropped = comboSearchJobs.has(requestedJobId);
+    dropComboSearchJob(requestedJobId);
+    return {
+      ok: true,
+      data: {
+        action: 'expandCombo',
+        cancelled: dropped,
+        droppedJob: dropped ? requestedJobId : null,
+        retainedJobCount: comboSearchJobs.size,
+      },
+    };
+  }
+  let resumeJob = null;
+  if (requestedJobId) {
+    resumeJob = takeComboSearchJob(requestedJobId);
+    if (!resumeJob) {
+      return {
+        ok: false,
+        code: 'COMBO_JOB_NOT_FOUND',
+        error: `No resumable expandCombo job ${JSON.stringify(requestedJobId)} on this engine host. It was never started here, was already cancelled, or was evicted by newer jobs.`,
+        data: { jobId: requestedJobId, retainedJobCount: comboSearchJobs.size },
+      };
+    }
+  }
+  if (record.resumeState !== undefined) {
+    // The resume payload is host-private by design; accepting it from the model
+    // would put the whole DFS stack back into the payload it was moved out of.
+    return {
+      ok: false,
+      code: 'RESUME_STATE_IS_HOST_PRIVATE',
+      error: 'Do not pass resumeState: it is kept on the engine host. Continue with expandCombo({ jobId }) instead.',
     };
   }
 
@@ -868,6 +977,10 @@ async function expandComboRoutes(context, input, config, moduleCache) {
     playerDeck = api.parseYdkText(ydkText);
   }
 
+  const timeSliceMs = resolveComboTimeSliceMs(record.timeSliceMs);
+  const requestedTimeSliceMs = Number.isFinite(Number(record.timeSliceMs)) && Number(record.timeSliceMs) > 0
+    ? Math.trunc(Number(record.timeSliceMs))
+    : null;
   const result = await searchComboRoutes({
     playerDeck,
     openingCodes: Array.isArray(record.openingCodes)
@@ -880,9 +993,33 @@ async function expandComboRoutes(context, input, config, moduleCache) {
     topK: record.topK,
     diversityCap: record.diversityCap,
     cardsPath: config.cardsDbPath,
+    timeBudgetMs: timeSliceMs,
+    yieldEveryNodes: COMBO_YIELD_EVERY_NODES,
+    resumeState: resumeJob?.resumeState ?? undefined,
   });
   if (result?.ok !== true) {
     return { ok: false, code: 'SEARCH_FAILED', error: readString(result?.error) ?? 'combo search failed' };
+  }
+  const data = asRecord(result.data);
+  const nodesSoFar = Number(data.nodes) || 0;
+  const completed = data.completed === true;
+  const stopReason = readString(data.stopReason) ?? 'UNKNOWN';
+  const timeSlice = asRecord(data.timeSlice);
+  const elapsedMs = Number(timeSlice.elapsedMs);
+  const consumedMs = Number.isFinite(elapsedMs) ? Math.round(elapsedMs) : null;
+  const resumable = !completed && result.resumeState != null;
+  // Forgettable the moment it is finished: keeping a completed search's stack would
+  // only occupy one of the bounded slots.
+  if (resumeJob) dropComboSearchJob(requestedJobId);
+  let jobId = null;
+  if (resumable) {
+    jobId = randomUUID();
+    putComboSearchJob(jobId, {
+      resumeState: result.resumeState,
+      createdAt: Date.now(),
+      deckName: readString(session.metadata.currentDeckName) ?? null,
+      timeSliceMs,
+    });
   }
   return {
     ok: true,
@@ -890,7 +1027,33 @@ async function expandComboRoutes(context, input, config, moduleCache) {
       action: 'expandCombo',
       deckSource: sessionDeck ? 'session' : 'ydk',
       deckName: readString(session.metadata.currentDeckName) ?? null,
-      ...result.data,
+      ...data,
+      // Slice accounting uses the existing stopReason/completed vocabulary; these
+      // fields only say which budget ran out and what is left of it. `nodes` stays
+      // the cumulative total so a continued slice is visibly larger, not a repeat.
+      jobId,
+      resumable,
+      continuedFromJobId: resumeJob ? requestedJobId : null,
+      nodesSoFar,
+      ordersTruncated: !completed,
+      retainedJobCount: comboSearchJobs.size,
+      slice: {
+        timeSliceMs,
+        // Only when it differs, so a request clamped to MAX_COMBO_TIME_SLICE_MS is
+        // visible instead of silently honored.
+        ...(requestedTimeSliceMs === null || requestedTimeSliceMs === timeSliceMs ? {} : { requestedTimeSliceMs }),
+        consumedMs,
+        remainingMs: typeof timeSlice.remainingMs === 'number' ? Math.round(timeSlice.remainingMs) : null,
+        endedByTimeSlice: timeSlice.endedByTimeSlice === true,
+        maxNodes: Number(data.budget?.maxNodes) || null,
+        nodesAtSliceStart: Number(data.nodesAtSliceStart) || 0,
+        nodesThisSlice: Number(data.nodesThisSlice) || 0,
+      },
+      note: resumable
+        ? `${stopReason === 'TIME_SLICE'
+            ? `The search used its whole ${timeSliceMs} ms slice`
+            : `The search stopped at a budget boundary`} (stopReason=${stopReason}) and returned partial routes. Call expandCombo({ jobId: "${jobId}" }) to continue from here; call expandCombo({ jobId: "${jobId}", cancel: true }) when done.`
+        : null,
     },
   };
 }

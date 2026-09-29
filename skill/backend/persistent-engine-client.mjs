@@ -5,7 +5,7 @@ import {
   DEFAULT_ENGINE_PORT,
   ENGINE_HOST_PROTOCOL,
 } from './persistent-engine-server.mjs';
-import { ENGINE_TOKEN_ENV, ENGINE_TOKEN_HEADER, resolveEngineToken } from './engine-token.mjs';
+import { ENGINE_TOKEN_ENV, ENGINE_TOKEN_HEADER, resolveEngineToken, resolveEngineTokenFilePath } from './engine-token.mjs';
 
 const SERVER_ENTRY = fileURLToPath(new URL('./persistent-engine-server.mjs', import.meta.url));
 
@@ -23,45 +23,248 @@ export function createPersistentEngineClient(options = {}) {
   const childEnv = { ...process.env, ...asRecord(options.serverEnv) };
   // Shared, persisted across DSH restarts so a fresh client can still reach a
   // detached engine host that outlived the previous plugin process.
-  const engineToken = readString(options.token)
-    ?? readString(childEnv[ENGINE_TOKEN_ENV])
-    ?? resolveEngineToken(childEnv).token;
+  const envToken = readString(options.token) ?? readString(childEnv[ENGINE_TOKEN_ENV]);
+  const tokenResolution = envToken ? null : resolveEngineToken(childEnv);
+  const engineToken = envToken ?? tokenResolution.token;
+  // Where the shared token is read from or written to, so an unreachable host
+  // can be reported with the path instead of only "connection refused". It is
+  // resolved even for an explicit token, because the host this client spawns
+  // receives that same path through the environment.
+  const tokenPath = resolveEngineTokenFilePath(childEnv);
+  // A failed start must not be re-attempted by every single call (each attempt
+  // costs a spawn plus the readiness wait), but it must never be cached
+  // forever. After this cooldown a later call performs a fresh cold start.
+  const startRetryCooldownMs = normalizeTimeout(options.startRetryCooldownMs, 1000);
   let starting = null;
+  // The last failed probe/start, kept only so calls inside the cooldown fail
+  // fast with the real reason. Cleared by a successful probe or an explicit
+  // restart.
+  let lastFailure = null;
+  let lastStartAttemptAt = 0;
 
+  function hostDiagnostics() {
+    return { hostname, port, baseUrl, tokenPath };
+  }
+
+  /**
+   * Probe the host and return its state plus enough diagnostics to explain a
+   * failure: `{ ok, reachable, code, error, hostname, port, baseUrl, tokenPath,
+   * lastError, needsRestart }`.
+   *
+   * Probing never starts anything; recovery happens in `ensureStarted`.
+   */
   async function health() {
     try {
       const result = await requestJson(`${baseUrl}/health`, { timeoutMs: 1500, token: engineToken });
       if (result.protocol !== ENGINE_HOST_PROTOCOL) {
-        return { ok: false, code: 'ENGINE_HOST_PROTOCOL_MISMATCH', error: `Port ${port} is occupied by an incompatible service.` };
+        const error = `Port ${port} is occupied by an incompatible service.`;
+        return {
+          ...result,
+          ...hostDiagnostics(),
+          ok: false,
+          reachable: true,
+          needsRestart: true,
+          code: 'ENGINE_HOST_PROTOCOL_MISMATCH',
+          error,
+          lastError: error,
+        };
       }
-      return result;
+      // A host that answers /health with the right protocol is genuinely back:
+      // a recorded failure must not outlive it.
+      lastFailure = null;
+      return {
+        ...result,
+        ...hostDiagnostics(),
+        ok: true,
+        reachable: true,
+        // A reachable host that is already closing still owns the port, so it
+        // must be replaced instead of reused.
+        needsRestart: result.closing === true,
+        lastError: null,
+      };
     } catch (error) {
-      return { ok: false, code: 'ENGINE_HOST_UNAVAILABLE', error: error instanceof Error ? error.message : String(error) };
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ...hostDiagnostics(),
+        ok: false,
+        reachable: false,
+        needsRestart: true,
+        code: 'ENGINE_HOST_UNAVAILABLE',
+        error: message,
+        // Prefer the recorded start failure: "did not become ready" is more
+        // actionable than the connection error that followed it.
+        lastError: lastFailure?.error ?? message,
+      };
     }
   }
 
   async function ensureStarted() {
     const current = await health();
-    if (current.ok) return current;
-    if (current.code === 'ENGINE_HOST_PROTOCOL_MISMATCH' || !autoStart) throw new Error(current.error);
-    if (!starting) {
-      starting = startDetachedHost({
-        hostname,
-        port,
-        token: engineToken,
-        env: childEnv,
-      }).finally(() => { starting = null; });
+    if (current.ok && current.needsRestart !== true) {
+      lastFailure = null;
+      return current;
     }
-    await starting;
+    if (!autoStart) throw startFailure(current);
+    // The port must be free before spawning: a host that is still shutting down
+    // would make the fresh process die on EADDRINUSE and burn the whole startup
+    // timeout for nothing.
+    if (current.reachable) await waitForUnreachable(2000);
+    return startAndWait(current);
+  }
+
+  /**
+   * Cold start the host and wait until it answers, or fail with diagnostics.
+   *
+   * The failure is cached only for the cooldown window; every later call
+   * attempts a genuinely fresh start, so a transient failure (a port still in
+   * TIME_WAIT, a crashed host, an early exit) can always recover without
+   * restarting DSH.
+   */
+  async function startAndWait(reason) {
+    if (starting) {
+      // Another call is already starting a host: join it instead of racing a
+      // second process onto the same port.
+      try {
+        await starting;
+      } catch {
+        // The readiness loop below reports the failure with diagnostics.
+      }
+      return waitUntilReady(reason, null);
+    }
+    const now = Date.now();
+    if (lastFailure && now - lastStartAttemptAt < startRetryCooldownMs) {
+      throw startFailure(reason, lastFailure);
+    }
+    lastStartAttemptAt = now;
+    let exited = null;
+    starting = startDetachedHost({
+      hostname,
+      port,
+      token: engineToken,
+      env: childEnv,
+    }).then((child) => {
+      // A host that dies while we wait (port taken, startup crash) must fail
+      // fast instead of holding the caller for the whole startup timeout.
+      child.once('exit', (code, signal) => { exited = { code, signal }; });
+    }).finally(() => { starting = null; });
+    try {
+      await starting;
+    } catch (error) {
+      lastFailure = { at: Date.now(), code: 'ENGINE_HOST_START_FAILED', error: messageOf(error) };
+      throw startFailure(reason, lastFailure);
+    }
+    return waitUntilReady(reason, () => exited);
+  }
+
+  async function waitUntilReady(reason, childExit) {
     const deadline = Date.now() + startupTimeoutMs;
-    let last;
-    while (Date.now() < deadline) {
-      last = await health();
-      if (last.ok) return last;
-      if (last.code === 'ENGINE_HOST_PROTOCOL_MISMATCH') throw new Error(last.error);
+    let last = await health();
+    for (;;) {
+      if (last.ok && last.needsRestart !== true) {
+        lastFailure = null;
+        return last;
+      }
+      const exit = typeof childExit === 'function' ? childExit() : null;
+      if (exit) {
+        lastFailure = {
+          at: Date.now(),
+          code: 'ENGINE_HOST_START_FAILED',
+          error: `The persistent engine host exited (code ${exit.code ?? 'null'}`
+            + `${exit.signal ? `, signal ${exit.signal}` : ''}) before it became ready.`,
+        };
+        throw startFailure(last, lastFailure);
+      }
+      if (Date.now() >= deadline) {
+        lastFailure = {
+          at: Date.now(),
+          code: last.code ?? 'ENGINE_HOST_UNAVAILABLE',
+          error: `Persistent engine host did not become ready within ${startupTimeoutMs} ms: ${last.error ?? 'unknown error'}`,
+        };
+        throw startFailure(last, lastFailure);
+      }
       await delay(75);
+      last = await health();
     }
-    throw new Error(`Persistent engine host did not become ready within ${startupTimeoutMs} ms: ${last?.error ?? 'unknown error'}`);
+  }
+
+  async function waitForUnreachable(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const current = await health();
+      if (!current.ok && current.reachable !== true) return true;
+      if (Date.now() >= deadline) return false;
+      await delay(50);
+    }
+  }
+
+  /**
+   * Shut the host down (when it is reachable), clear every cached start/health
+   * failure, then cold start a fresh host.
+   *
+   * This is the explicit recovery path for a host that is alive but wedged, and
+   * the only path allowed to ignore the start-failure cooldown.
+   */
+  async function restart() {
+    // Never clear the cache underneath an in-flight start: that would let two
+    // hosts race onto the same port.
+    if (starting) {
+      try {
+        await starting;
+      } catch {
+        // Nothing is left to shut down.
+      }
+    }
+    const before = await health();
+    let shutdownError = null;
+    if (before.reachable) {
+      try {
+        await requestJson(`${baseUrl}/execute`, {
+          method: 'POST',
+          body: { call: { name: 'manageEngineSession', input: { action: 'restart' } }, sessionId: 'default' },
+          token: engineToken,
+          timeoutMs: 5000,
+        });
+      } catch (error) {
+        // The host may drop the connection mid-response; that is the expected
+        // end of a restart when the process exits while answering.
+        shutdownError = messageOf(error);
+      }
+      if (!await waitForUnreachable(5000)) {
+        shutdownError = shutdownError ?? `The engine host was still answering on ${baseUrl} after being asked to restart.`;
+      }
+    }
+    starting = null;
+    lastFailure = null;
+    lastStartAttemptAt = 0;
+    const current = await ensureStarted();
+    return {
+      ...current,
+      restarted: true,
+      previousPid: Number.isInteger(before.pid) ? before.pid : null,
+      shutdownError,
+    };
+  }
+
+  function startFailure(reason, failure = reason) {
+    const error = new Error(failure?.error ?? 'Persistent engine host is unavailable.');
+    // serializeEngineFailure in the plugin entry treats any code other than
+    // ENGINE_HOST_FAILURE as an engine-side rejection, so a dead host must keep
+    // this exact code; the detail travels in `data` instead.
+    error.code = 'ENGINE_HOST_FAILURE';
+    error.data = {
+      engineHost: {
+        ...hostDiagnostics(),
+        reachable: false,
+        needsRestart: true,
+        lastError: error.message,
+        failureCode: failure?.code ?? reason?.code ?? 'ENGINE_HOST_UNAVAILABLE',
+      },
+    };
+    return error;
+  }
+
+  function messageOf(error) {
+    return error instanceof Error ? error.message : String(error);
   }
 
   async function execute(call, executeOptions = {}) {
@@ -80,7 +283,10 @@ export function createPersistentEngineClient(options = {}) {
     return result.tools;
   }
 
-  return { hostname, port, baseUrl, hasToken: Boolean(engineToken), health, ensureStarted, execute, listTools };
+  // `health` is the diagnostic probe (it never starts the host); every other
+  // entry point lazy-starts it, and `restart` is the explicit shutdown + cold
+  // start recovery path.
+  return { hostname, port, baseUrl, tokenPath, hasToken: Boolean(engineToken), health, ensureStarted, restart, execute, listTools };
 }
 
 function startDetachedHost(options) {
@@ -104,7 +310,9 @@ function startDetachedHost(options) {
       child.once('error', reject);
       child.once('spawn', () => {
         child.unref();
-        resolve();
+        // The caller watches for an early exit so a host that dies during
+        // start-up fails fast instead of consuming the startup timeout.
+        resolve(child);
       });
     } catch (error) {
       reject(error);

@@ -6432,6 +6432,8 @@ function searchTopLongestPathsRandom(runner, opts) {
   return best;
 }
 
+// Async only because the core search now awaits its optional slice yield. With no
+// yield configured the promise is already settled when it is returned.
 function searchTopLongestPaths(runner, opts) {
   return getExactSearchApi().searchTopLongestPathsExactSingle(runner, opts);
 }
@@ -6740,7 +6742,7 @@ async function runSingleSearchJob(job) {
     }
 
     const searchStartNs = process.hrtime.bigint();
-    const result = searchTopLongestPaths(runner, {
+    const result = await searchTopLongestPaths(runner, {
       maxDepth: job.maxDepth,
       maxNodes: job.maxNodes,
       targetTerminals: job.targetTerminals,
@@ -6756,6 +6758,10 @@ async function runSingleSearchJob(job) {
       topPathPolicy: job.topPathPolicy,
       onStateVisit: job.onStateVisit,
       resumeState: job.resumeState,
+      // Slice controls are opt-in so every existing caller keeps the old
+      // synchronous, unbounded behavior.
+      timeBudgetMs: job.timeBudgetMs,
+      yieldEveryNodes: job.yieldEveryNodes,
       searchStartedAtMs: job.searchStartedAtMs ?? job.startedAtMs,
       debugTrace: job.debugTrace,
       recordIntermediateScoredStates: Array.isArray(job.scoringRules) && job.scoringRules.length > 0,
@@ -6935,7 +6941,12 @@ function summarizeStateVisits(stateVisits) {
  */
 async function searchComboRoutes(options = {}) {
   try {
-    return { ok: true, data: await runComboRouteSearch(options) };
+    const data = await runComboRouteSearch(options);
+    // `resumeState` is deliberately a sibling of `data`, never inside it: it is an
+    // opaque continuation handle for the caller's job store, not part of the
+    // model-facing route result.
+    const { resumeState, ...publicData } = data;
+    return { ok: true, data: publicData, resumeState: resumeState ?? null };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
@@ -7018,12 +7029,31 @@ async function runComboRouteSearch(options) {
     profileCore: false,
     verbose: options.verbose === true,
     searchStartedAtMs: Date.now(),
+    // Wall-clock slice. Left undefined by callers that want the old unbounded
+    // behavior (the parallel/worker paths never set it).
+    timeBudgetMs: options.timeBudgetMs,
+    yieldEveryNodes: options.yieldEveryNodes,
+    // Continuation handle from a previous slice. Only meaningful together with
+    // timeBudgetMs; a resumed search re-walks the restored DFS stack first, so its
+    // node counter starts at the count already reached.
+    resumeState: options.resumeState,
   };
+
+  // A resumed search starts its node counter at the count the previous slice
+  // reached, so this is what "nodes added by this slice" has to be measured from.
+  const invocationStartNodes = Number(job.resumeState?.best?.nodes ?? 0) || 0;
 
   const { result, searchElapsedMs, initialPlayerHand } = await runSingleSearchJob(job);
   const topPaths = Array.isArray(result?.topPaths) ? result.topPaths : [];
   const { routes, collapsed } = collapsePlacementVariants(topPaths, requestedTopK);
   const stateStats = stateVisits ? summarizeStateVisits(stateVisits) : null;
+  // The raw resume payload is never part of the model-facing result: it carries the
+  // serialized DFS stack (root state, every pending frame) and is large enough that
+  // serializing it on every hop has already blown a 2 GB V8 heap once (see the
+  // CHECKPOINT_INTERVAL_MS note in exact-search.cjs). `searchComboRoutes` returns it
+  // separately so the host can key it by job id and hand back only a small handle.
+  const resumeState = job.timeBudgetMs ? (result?.resumeState ?? null) : null;
+  const totalNodes = result?.nodes ?? 0;
   return {
     openingCodes: playerOpening.opening.slice(),
     openingRemainCount: playerOpening.remain.length,
@@ -7032,11 +7062,18 @@ async function runComboRouteSearch(options) {
     routes,
     routesConsidered: topPaths.length,
     routesCollapsedAsPlacementVariants: collapsed,
-    nodes: result?.nodes ?? 0,
+    nodes: totalNodes,
+    // How much of `nodes` this invocation actually paid for. On a resumed slice the
+    // count starts where the previous slice stopped, so `nodes` alone cannot tell
+    // "continued" from "repeated".
+    nodesAtSliceStart: invocationStartNodes,
+    nodesThisSlice: Math.max(0, totalNodes - invocationStartNodes),
     terminalCount: result?.terminalCount ?? 0,
     completed: result?.completed !== false,
     stopReason: result?.stopReason ?? 'UNKNOWN',
     searchElapsedMs,
+    ...(result?.timeSlice ? { timeSlice: result.timeSlice } : {}),
+    resumeState,
     seed,
     drawCount,
     budget: {

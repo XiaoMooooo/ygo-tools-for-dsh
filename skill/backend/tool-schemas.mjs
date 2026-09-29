@@ -45,7 +45,7 @@ export const TOOL_DESCRIPTIONS = Object.freeze({
   listActions: 'Return a compact bounded page of current legal actions, optionally filtered by category, with factorized-selection constraints when a full combination set would be too large.',
   executeAction: 'Execute one current legal action and return the updated state plus next legal actions so another state/action fetch is normally unnecessary.',
   simulateActions: 'Simulate a short legal action sequence and restore the original live state afterward.',
-  expandCombo: 'Search engine-verified combo routes for the loaded deck and return ranked action lines, instead of stepping one action per call. The search runs inside the engine host: use this instead of writing your own search script or harness.',
+  expandCombo: 'Search engine-verified combo routes for the loaded deck and return ranked action lines, instead of stepping one action per call. The search runs inside the engine host: use this instead of writing your own search script or harness. Every call is bounded by a wall-clock slice; a search that runs out of it stops cleanly and returns resumable:true with a jobId, which expandCombo({jobId}) continues and expandCombo({jobId,cancel:true}) drops.',
   planRoute: 'Order declared combo steps by their dependencies and return valid orderings, or explain why they cannot be ordered.',
   saveCheckpoint: 'Save the current live runner state as an in-memory checkpoint.',
   restoreCheckpoint: 'Restore an in-memory checkpoint by id, name, or latest checkpoint.',
@@ -58,6 +58,7 @@ export const TOOL_DESCRIPTIONS = Object.freeze({
   saveReplayYrp: 'Save embedded response history or an authoritative raw AI.Server replay; a running real duel can be surrendered and exported atomically.',
   saveRouteFile: 'Save a verified route report after explicit user authorization.',
   getEngineSessionStatus: 'Inspect whether the persistent engine host still owns the current session, runner, deck, and checkpoints.',
+  restartEngineHost: 'Restart the persistent engine host: stop it, drop every live engine session, and cold start a fresh host.',
   clearEngineSession: 'Explicitly destroy and clear only the current persistent engine session.',
   shutdownEngineHost: 'Explicitly destroy every engine session and stop the persistent local engine host process.',
 });
@@ -274,6 +275,21 @@ export const TOOL_INPUT_SCHEMAS = Object.freeze({
       maxDepth: { type: 'integer', minimum: 1 },
       topK: { type: 'integer', minimum: 1 },
       diversityCap: { type: 'integer', minimum: 0 },
+      timeSliceMs: {
+        type: 'integer',
+        minimum: 1,
+        description: 'Wall-clock budget for this call. Defaults to 15000 and is capped at 60000. A search that runs out of its slice stops cleanly, returns what it found plus a jobId, and can be continued.',
+      },
+      jobId: {
+        type: 'string',
+        minLength: 1,
+        description: 'Continue the search from a previous slice: pass the jobId the earlier call returned, or null to drop it. The resume state itself stays on the engine host and is never part of this payload.',
+      },
+      cancel: { type: 'boolean', description: 'Drop the job named by jobId instead of searching, so a long-lived host does not accumulate continuation handles.' },
+      resumeState: {
+        type: 'object',
+        description: 'Host-private. Never send this: the engine host keeps the resume state keyed by jobId and rejects a payload that carries it.',
+      },
     },
     additionalProperties: false,
   },
@@ -414,6 +430,9 @@ export const TOOL_INPUT_SCHEMAS = Object.freeze({
     additionalProperties: false,
   },
   getEngineSessionStatus: emptyObject,
+  // `restart` needs no confirm: it is the recovery action for a host that is
+  // already unreachable, where there is nothing left to confirm.
+  restartEngineHost: emptyObject,
   clearEngineSession: {
     type: 'object',
     properties: {
@@ -459,7 +478,7 @@ export const PUBLIC_TOOL_DESCRIPTIONS = Object.freeze({
   analyzeReplay: 'Parse replay bytes or a replay file, build model-readable route context, or do both in one call. Works offline for .yrp, .yrp2 and .yrp3d: it starts its own embedded engine, so it needs neither a live YGOPro2 bridge nor a duel runner. Never parse a replay by hand or with a script.',
   analyzeCombo: 'Normalize a combo artifact or adapt it against the deck loaded in the current session.',
   saveArtifact: 'Save a replay or a verified route report after explicit user authorization.',
-  manageEngineSession: 'Inspect, clear, or fully shut down the persistent engine session host.',
+  manageEngineSession: 'Inspect, restart, clear, or fully shut down the persistent engine session host.',
 });
 
 // Single source of truth for public action routing: which internal tool each
@@ -514,6 +533,7 @@ export const PUBLIC_TOOL_ACTIONS = Object.freeze({
   }),
   manageEngineSession: Object.freeze({
     status: Object.freeze({ tool: 'getEngineSessionStatus' }),
+    restart: Object.freeze({ tool: 'restartEngineHost' }),
     clear: Object.freeze({ tool: 'clearEngineSession' }),
     shutdown: Object.freeze({ tool: 'shutdownEngineHost' }),
   }),
@@ -641,7 +661,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   manageEngineSession: {
     type: 'object',
     properties: {
-      action: actionProperty(['status', 'clear', 'shutdown'], 'status: inspect this session. clear and shutdown both require confirm:true.'),
+      action: actionProperty(['status', 'restart', 'clear', 'shutdown'], 'status: inspect this session; the host is cold started when it is unreachable, and the reply reports reachable/port/tokenPath/lastError/needsRestart. restart: shut the engine host down and cold start a fresh one, dropping every live engine session; use it when the engine host is unreachable or wedged. clear and shutdown both require confirm:true.'),
       confirm: { type: 'boolean', description: 'Must be true for clear or shutdown.' },
     },
     required: ['action'],

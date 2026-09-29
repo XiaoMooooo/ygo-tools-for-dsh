@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **P1：`expandCombo` 不再把主机进程拖死，搜索可切片续跑**。此前整段搜索同步跑在服务所有工具调用的引擎主机进程里：一次 `maxNodes:6000` 的真实调用跑了 120 秒并把主机打死，整个会话随后丢掉全部 16 个 YGO 工具。现在每次 `expandCombo` 都受墙钟切片约束（`timeSliceMs`，默认 15000 ms，上限 60000 ms），切片到时搜索在 DFS 帧边界干净停止，引擎既有的 `resumeState` 被主机按 job id 存放（只保留最近 N 个，`YGO_COMBO_JOB_CAP` 可调，默认 8），返回给模型的只有 `{ jobId, resumable, nodesSoFar, stopReason, slice }`；用 `expandCombo({jobId})` 继续会从断点接着搜（节点数累计增长），`expandCombo({jobId,cancel:true})` 释放。搜索完成的调用不再序列化 resumeState，也不会留下 job。切片内部每 64 个节点 `setImmediate` 让出一次事件循环，所以长任务进行中同进程的其它工具调用仍能被服务。
+- 新增 `combo-slice` 测试套件（58 项）：切片边界与 `stopReason:"TIME_SLICE"` 的诚实报告、续跑节点累计增长、模型负载不含 resume state 且 < 100 KB、完成即不留 job、job 存储有界且淘汰最旧、以及「长任务进行中 `queryCards` 仍能应答」。
+- **P0 可用性修复：引擎主机不再永久失联**。此前主机进程崩溃/启动失败后，客户端会把失败状态缓存下来（端口被占用时 `ensureStarted` 直接抛出 `ENGINE_HOST_PROTOCOL_MISMATCH`），后续任何 YGO 工具调用都只能拿到同一个错误，只能重启 DSH 桌面端。现在启动失败只缓存一个 1 秒冷却窗口，冷却后每次调用都会重新冷启动；host 子进程在就绪前退出会立刻失败而不是耗满启动超时。客户端新增 `restart()`（停机 + 清空缓存 + 冷启动），`manageEngineSession` 新增 `action:"restart"`（无需 `confirm`，会丢弃全部引擎会话），`status` 现在返回 `reachable` / `hostname` / `port` / `baseUrl` / `tokenPath` / `lastError` / `needsRestart` 诊断字段，并在主机不可达时先尝试冷启动。
+- 新增 31 项 `engine-host` 测试（24 → 55），覆盖诊断字段、`restart` 契约、真实 `process.kill` 后的自动冷启动，以及「端口被外来服务占用（协议不匹配）时不再永久抛出缓存错误，而是继续探测并尝试冷启动」；`lib/dsh-skill.md`、`skill/references/backend-commands.md`、`skill/references/prompt-global.md` 已同步。
 - **新增 `planRoute` 工具（第 16 个公开工具）**：把展开步骤的依赖（`requires` / `provides` / `after`）建成显式 DAG，用拓扑排序给出**多条合法顺序**，并明确报告环、无提供者的需求、未知引用、目标是否可达，以及关键路径（最少步数）。纯函数、不碰引擎，输出仍需逐步执行验证。
 - **搜索结果可复现**：移动排序与路线排名的 tie-break 不再依赖 `localeCompare` 与墙钟时间，改为码点比较与「发现时节点数」；同一 seed 两次运行得到逐字节一致的路线。
 - 新增纯模块 `action-order.cjs`（交换律规范化与签名分组）与 `route-planner.cjs`，配套 46 项单测。

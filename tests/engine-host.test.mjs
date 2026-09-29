@@ -5,6 +5,7 @@
 // where the harness forbids capturing a child's piped stdio.
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
 import { join } from 'node:path';
 import { reporter, ROOT } from './harness.mjs';
 
@@ -106,6 +107,118 @@ t.assert('search returns results', Array.isArray(results) && results.length > 0,
 t.note(`hits: ${results.slice(0, 3).map((c) => c?.name).join(' | ')}`);
 t.check('get by name succeeds', (await call('queryCards', { action: 'get', cardName: card })).ok, true);
 t.check('engine status still works', (await call('manageEngineSession', { action: 'status' })).ok, true);
+
+t.section('engine host diagnostics');
+const status = await call('manageEngineSession', { action: 'status' });
+t.check('status reports the host as reachable', status.data?.reachable, true);
+t.check('status reports the configured port', status.data?.port, PORT);
+t.check('status reports the host is not stale', status.data?.needsRestart, false);
+t.check('status reports no error while healthy', status.data?.lastError, null);
+t.check('status reports the token path the client used', status.data?.tokenPath, client.tokenPath);
+t.assert('the client resolved a real token path',
+  typeof client.tokenPath === 'string' && client.tokenPath.length > 0, String(client.tokenPath));
+
+t.section('restart is an accepted manageEngineSession action');
+const { validatePublicToolInput } = await import(`file:///${ROOT}/skill/backend/tool-schemas.mjs`);
+const restartValidation = validatePublicToolInput('manageEngineSession', { action: 'restart' });
+t.assert('restart validates with no extra fields', restartValidation.ok,
+  JSON.stringify(restartValidation.errors));
+t.check('a misspelled action is still refused', validatePublicToolInput('manageEngineSession', { action: 'restartt' }).errors?.[0]?.code,
+  'INVALID_ACTION');
+
+t.section('regression: a killed host is cold started by the next tool call');
+const beforeKill = await client.health();
+t.assert('health reports the running host pid', Number.isInteger(beforeKill.pid), JSON.stringify(beforeKill));
+// Kill the host out from under the client: this is the P0 failure mode where
+// every later YGO tool call used to fail until DSH itself was restarted.
+process.kill(beforeKill.pid);
+let killed = false;
+for (let i = 0; i < 100; i += 1) {
+  if (!(await client.health()).ok) { killed = true; break; }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+t.assert('the killed host stops answering /health', killed, 'the host was still healthy after process.kill');
+const recoveredCall = await call('queryCards', { action: 'get', cardName: card });
+t.check('an ordinary tool call succeeds without outside help', recoveredCall.ok, true);
+const afterKill = await client.health();
+t.check('the engine host is reachable again', afterKill.reachable, true);
+t.assert('recovery started a new host process',
+  Number.isInteger(afterKill.pid) && afterKill.pid !== beforeKill.pid,
+  `before=${beforeKill.pid} after=${afterKill.pid}`);
+t.check('the recovered host is not stale', afterKill.needsRestart, false);
+
+t.section('regression: a cached start failure is never permanent');
+// A port owned by a service that is not our host. It answers /health with a
+// foreign protocol, which used to make ensureStarted throw
+// ENGINE_HOST_PROTOCOL_MISMATCH on every later call, forever, even after the
+// foreign service was gone: the session lost every YGO tool until DSH restarted.
+const BUSY_PORT = PORT + 1;
+let healthProbes = 0;
+const blocker = createHttpServer((request, response) => {
+  healthProbes += 1;
+  response.setHeader('Content-Type', 'application/json');
+  response.end(JSON.stringify({ ok: true, protocol: 'not-the-engine-host' }));
+});
+await new Promise((resolve, reject) => {
+  blocker.once('error', reject);
+  blocker.listen(BUSY_PORT, '127.0.0.1', resolve);
+});
+const blockedClient = createPersistentEngineClient({
+  hostname: '127.0.0.1',
+  port: BUSY_PORT,
+  autoStart: true,
+  startupTimeoutMs: 4000,
+  serverEnv: { YGO_CACHE_DIR: join(DATA, 'cache') },
+});
+let firstFailure = null;
+try {
+  await blockedClient.listTools();
+} catch (error) {
+  firstFailure = error;
+}
+t.assert('a start against an occupied port fails', firstFailure !== null,
+  'the client reported success on an occupied port');
+t.check('  with the dead-host code the plugin classifies on', firstFailure?.code, 'ENGINE_HOST_FAILURE');
+// The pre-fix client threw the cached protocol mismatch on the first probe and
+// never looked again; a recovering client keeps probing and does try to start.
+t.assert('the client kept probing instead of re-throwing a cached mismatch',
+  healthProbes > 5, `probes=${healthProbes}`);
+t.assert('the failure shows a fresh cold start was attempted',
+  /exited|did not become ready/.test(firstFailure?.message ?? ''), firstFailure?.message);
+const failedHealth = await blockedClient.health();
+t.check('the failed probe reports the foreign service as reachable', failedHealth.reachable, true);
+t.check('the failed probe asks for a restart', failedHealth.needsRestart, true);
+t.check('the failed probe names the port that is occupied', failedHealth.port, BUSY_PORT);
+t.assert('the failed probe carries a reason',
+  typeof failedHealth.lastError === 'string' && failedHealth.lastError.length > 0, JSON.stringify(failedHealth));
+// Release the port. closeAllConnections plus a capped wait keeps a pooled
+// keep-alive socket from hanging the suite.
+blocker.closeAllConnections?.();
+await new Promise((resolve) => {
+  blocker.close(() => resolve());
+  setTimeout(resolve, 500);
+});
+// The failure is cached for a short cooldown only. After it, the same client
+// must attempt a genuinely fresh cold start instead of re-throwing the cached
+// error for the rest of the session.
+await new Promise((resolve) => setTimeout(resolve, 1200));
+t.check('the same client cold starts once the port is free', (await blockedClient.listTools()).length, 16);
+t.check('the recovered host is reachable', (await blockedClient.health()).reachable, true);
+await blockedClient.execute({ name: 'manageEngineSession', input: { action: 'shutdown', confirm: true } });
+await new Promise((resolve) => setTimeout(resolve, 500));
+
+t.section('restart cold starts a fresh host');
+const beforeRestart = await client.health();
+const restarted = await client.restart();
+t.check('the host accepted the restart request', restarted.shutdownError, null);
+t.check('restart leaves a reachable host', restarted.reachable, true);
+t.check('restart reports the new host is not stale', restarted.needsRestart, false);
+t.check('restart reports the port it restored', restarted.port, PORT);
+t.check('restart reports which host it replaced', restarted.previousPid, beforeRestart.pid);
+t.assert('restart replaced the host process',
+  Number.isInteger(restarted.pid) && restarted.pid !== beforeRestart.pid,
+  `before=${beforeRestart.pid} after=${restarted.pid}`);
+t.check('a tool call works against the restarted host', (await call('manageEngineSession', { action: 'status' })).ok, true);
 
 await call('manageEngineSession', { action: 'shutdown', confirm: true });
 await new Promise((r) => setTimeout(r, 800));

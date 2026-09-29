@@ -760,7 +760,10 @@ function createExactSearchApi(deps) {
     };
   }
 
-  function searchTopLongestPathsExactSingle(runner, opts) {
+  // Async because of the cooperative slice yield (`opts.yieldEveryNodes`): with no
+  // yield configured the body still runs synchronously to completion and the
+  // returned promise is already settled.
+  async function searchTopLongestPathsExactSingle(runner, opts) {
     const resumeState = deserializeExactSearchResumeState(opts.resumeState);
     const best = resumeState?.best
       ? {
@@ -812,6 +815,24 @@ function createExactSearchApi(deps) {
     const disableChoiceBudget = !enableChoiceBudget;
     const depthLimited = Number.isFinite(opts.maxDepth) && opts.maxDepth > 0;
     const searchNodeLimit = resolveSearchNodeLimit(opts.maxNodes);
+    // 墙钟切片预算:与 maxNodes/nodeBudget 并列的第三种预算,用来把一次调用限制在
+    // 可预测的时间窗口内。到期时搜索干净地停在当前栈上并交回 resumeState,调用方
+    // 可以用它继续,而不是丢掉已经走过的节点。默认关闭(Infinity),所以 worker
+    // 分片和 CLI 路径的行为一字未变。
+    const searchDeadlineMs = Number.isFinite(Number(opts.timeBudgetMs)) && Number(opts.timeBudgetMs) > 0
+      ? Date.now() + Number(opts.timeBudgetMs)
+      : Number.POSITIVE_INFINITY;
+    // This invocation's own wall clock, not the whole logical search: a resumed
+    // search reports how long *this* slice ran.
+    const invocationStartNs = process.hrtime.bigint();
+    // 切片内部的协作让出点。搜索节点本身很贵(实测 ~20 ms/节点),每 N 个节点把控制权
+    // 还给事件循环,同进程里的其它工具调用就能在长任务进行中继续被服务。被让出的位置
+    // 不写状态、不影响任何搜索判定,因此不改变搜索结果;默认关闭,只有明确要求切片的
+    // 调用方才会打开。
+    const yieldEveryNodes = Number.isFinite(Number(opts.yieldEveryNodes)) && Number(opts.yieldEveryNodes) > 0
+      ? Math.trunc(Number(opts.yieldEveryNodes))
+      : 0;
+    let nextYieldAtNodes = yieldEveryNodes > 0 ? yieldEveryNodes : Number.POSITIVE_INFINITY;
     const searchStartedAtMs = Number.isFinite(Number(opts.searchStartedAtMs ?? opts.startedAtMs))
       ? Number(opts.searchStartedAtMs ?? opts.startedAtMs)
       : Date.now();
@@ -900,6 +921,14 @@ function createExactSearchApi(deps) {
     const hasReachedEffectiveNodeLimit = () => hasReachedSearchNodeLimit(best.nodes, effectiveNodeLimit);
     const hasReachedTargetTerminalLimit = () =>
       targetTerminals > 0 && best.terminalCount >= targetTerminals;
+    const hasReachedTimeBudget = () => Date.now() >= searchDeadlineMs;
+    // Cooperative yield point. Null unless the caller asked for slicing, so the
+    // synchronous worker/shard paths never schedule a microtask.
+    const maybeYieldToEventLoop = () => {
+      if (yieldEveryNodes <= 0 || best.nodes < nextYieldAtNodes) return null;
+      nextYieldAtNodes = best.nodes + yieldEveryNodes;
+      return new Promise((resolve) => setImmediate(resolve));
+    };
     const buildCurrentResumeState = () => serializeExactSearchResumeState({
       rootState,
       rootAncestorStateKeys,
@@ -1282,7 +1311,11 @@ function createExactSearchApi(deps) {
     ) => {
       let depth = startDepth;
       const seenStateKeys = new Set(cloneExactStateKeyPath(ancestorStateKeys));
-      while (best.nodes < effectiveNodeLimit && best.nodes < nodeHardLimit) {
+      // A forced chain can consume the whole node budget without ever returning to
+      // the main loop, so the wall-clock slice has to be honored here too. Stopping
+      // here leaves the stack untouched: the work done so far is already in the
+      // chain/resume payload and the next call re-walks it deterministically.
+      while (best.nodes < effectiveNodeLimit && best.nodes < nodeHardLimit && !hasReachedTimeBudget()) {
         const current = runner.currentDecision;
         const currentStateKey = buildCurrentDecisionStateKey(runner);
 
@@ -1436,6 +1469,9 @@ function createExactSearchApi(deps) {
 
     while (stack.length > 0 && best.nodes < effectiveNodeLimit) {
       if (hasReachedTargetTerminalLimit()) break;
+      // Ends the slice at a frame boundary: `stack` still holds the pending work,
+      // which is exactly what buildCurrentResumeState serializes below.
+      if (hasReachedTimeBudget()) break;
       const frame = stack[stack.length - 1];
       if (frame !== activeFrame) {
         try {
@@ -1519,6 +1555,10 @@ function createExactSearchApi(deps) {
       }
       runner.step(action);
       best.nodes += 1;
+      // Between slices the host event loop must be free: yield right after the
+      // node counter moves, while the DFS state is still consistent.
+      const mainYield = maybeYieldToEventLoop();
+      if (mainYield) await mainYield;
       frame.exploredChild = true;
       chain.push(action.label);
 
@@ -1663,26 +1703,50 @@ function createExactSearchApi(deps) {
       });
     }
     const stackHasPendingWork = stack.length > 0;
+    // A wall-clock slice that expired while the frontier was being prepared leaves
+    // no stack behind, so `stackHasPendingWork` alone would misreport it as
+    // "finished". `searchEndedByTimeSlice` keeps that boundary honest and is what
+    // the caller turns into `resumable`.
+    const searchEndedByTimeSlice = hasReachedTimeBudget();
     const endedByGlobalNodeLimit = stackHasPendingWork && hasReachedGlobalNodeLimit();
     const endedByNodeBudget =
       stackHasPendingWork &&
       !endedByGlobalNodeLimit &&
       hasReachedSliceNodeLimit();
     const endedByTargetTerminals = hasReachedTargetTerminalLimit();
-    const searchCompleted = !stackHasPendingWork && !endedByTargetTerminals;
+    const searchCompleted =
+      !stackHasPendingWork && !endedByTargetTerminals && !searchEndedByTimeSlice;
     if (best.topPaths.length === 0 && searchCompleted) {
       settleTerminal([], null, 'NO_RESULT', rootState);
     }
     best.completed = searchCompleted;
     best.stopReason = searchCompleted
       ? 'DONE'
-      : endedByGlobalNodeLimit
-        ? 'MAX_NODES'
-        : endedByNodeBudget
-          ? 'NODE_BUDGET'
-          : 'TARGET_TERMINALS';
+      : searchEndedByTimeSlice
+        ? 'TIME_SLICE'
+        : endedByGlobalNodeLimit
+          ? 'MAX_NODES'
+          : endedByNodeBudget
+            ? 'NODE_BUDGET'
+            : 'TARGET_TERMINALS';
     emitCheckpoint(true);
+    // Any incomplete stop is resumable — including MAX_NODES/NODE_BUDGET, which
+    // used to be resumable in the parallel path only. The caller decides what it
+    // keeps; here we only stop throwing the work away.
     best.resumeState = searchCompleted ? null : buildCurrentResumeState();
+    // Report the slice boundary in the same vocabulary as the node budgets: the
+    // caller reads `stopReason`/`completed`, and only needs the raw numbers to
+    // decide whether another slice is worth it.
+    best.timeSlice = {
+      budgetMs: Number.isFinite(Number(opts.timeBudgetMs)) && Number(opts.timeBudgetMs) > 0
+        ? Number(opts.timeBudgetMs)
+        : null,
+      elapsedMs: Number(process.hrtime.bigint() - invocationStartNs) / 1e6,
+      remainingMs: Number.isFinite(searchDeadlineMs)
+        ? Math.max(0, searchDeadlineMs - Date.now())
+        : null,
+      endedByTimeSlice: searchEndedByTimeSlice,
+    };
     if (onProgress) {
       onProgress({
         nodes: best.nodes,

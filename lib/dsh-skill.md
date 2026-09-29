@@ -35,13 +35,19 @@ eval、Node import、HTTP、CLI 或包装脚本调用后端。
 - `observeDuel`: `state` / `actions`
 - `executeAction`
 - `simulateActions`
-- `expandCombo`: 让引擎自己搜索展开路线，返回 top-K 条带评分的动作序列
+- `expandCombo`: 让引擎自己搜索展开路线，返回 top-K 条带评分的动作序列。
+  每次调用都有墙钟切片（`timeSliceMs`，默认 15000，上限 60000）：切片用完会
+  干净停止并返回 `resumable:true` + `jobId` + `slice.consumedMs/remainingMs`；
+  用 `expandCombo({jobId})` 接着搜（节点数会继续增长），用完再
+  `expandCombo({jobId,cancel:true})` 释放。`stopReason:"TIME_SLICE"`、
+  `completed:false`、`ordersTruncated:true` 表示路线只是部分结果。
+  resume 状态只存在引擎主机上，绝不放进工具参数。
 - `planRoute`: 按依赖排出展开步骤的合法顺序（可给多条），或解释为什么排不出
 - `manageCheckpoint`: `save` / `restore` / `list` / `delete`
 - `analyzeReplay`: `parse` / `context` / `analyze`
 - `analyzeCombo`: `parse` / `adapt`
 - `saveArtifact`: `replay` / `route`
-- `manageEngineSession`: `status` / `clear` / `shutdown`
+- `manageEngineSession`: `status` / `restart` / `clear` / `shutdown`
 
 ## 硬性规则
 
@@ -56,4 +62,8 @@ eval、Node import、HTTP、CLI 或包装脚本调用后端。
 - 默认纯内存，不写路线、录像、报告、日志、调试转储或工作流文件。
 - `manageEngineSession` 的 `clear` / `shutdown` 必须有明确需求并传
   `confirm:true`。
+- 引擎主机不可达或卡死时，用 `manageEngineSession({action:"restart"})`
+  停机并冷启动（不需要 `confirm`，但会丢失全部引擎会话）；`status` 会
+  自动尝试冷启动，并返回 `reachable` / `port` / `tokenPath` / `lastError`
+  / `needsRestart`。
 - 不创建数值化对局评分；直接比较已验证的资源、封锁、区域和合法后续。

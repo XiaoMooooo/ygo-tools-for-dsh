@@ -10,6 +10,11 @@ Call `manageEngineSession({action:"status"})` first. DeepSeek Harness binds the
 current agent to one persistent engine session automatically; never create or
 pass a session ID. Use `resetGame` for a new duel. Use `manageEngineSession`
 actions `clear` or `shutdown` with `confirm:true` only for explicit teardown.
+`status` reports `reachable`, `port`, `tokenPath`, `lastError`, and
+`needsRestart`, and cold starts the host when it is unreachable. Action
+`restart` (no `confirm`) stops the host and cold starts a fresh one; it drops
+every live engine session, so use it only to recover an unreachable or wedged
+host.
 
 ## Public Tools
 
@@ -29,7 +34,14 @@ actions `clear` or `shutdown` with `confirm:true` only for explicit teardown.
   the next decision.
 - `simulateActions`: compare a short embedded continuation without committing.
 - `expandCombo`: search engine-verified combo routes for the loaded deck and get
-  ranked action lines with scores, instead of stepping one action per call.
+  ranked action lines with scores, instead of stepping one action per call. Every
+  call is bounded by a wall-clock slice (`timeSliceMs`, default 15000, capped at
+  60000). A search that runs out of its slice stops cleanly and answers with
+  `resumable:true` plus a `jobId` and `slice.{consumedMs,remainingMs}`; continue it
+  with `expandCombo({jobId})` (the node count keeps growing) and drop it with
+  `expandCombo({jobId,cancel:true})`. `stopReason:"TIME_SLICE"` with
+  `completed:false` and `ordersTruncated:true` means the routes are partial, not
+  exhausted. Never send a resume state: it stays on the engine host.
 - `planRoute`: order declared steps by their dependencies and get the valid
   orderings, or an explanation of the cycle, the missing requirement, or the
   unreachable goal that prevents ordering. Purely declarative: no engine runs.
@@ -40,7 +52,7 @@ actions `clear` or `shutdown` with `confirm:true` only for explicit teardown.
   compares it with the loaded deck.
 - `saveArtifact`: `action:"replay"` or `action:"route"`; use only for an
   explicitly requested file.
-- `manageEngineSession`: actions `status`, `clear`, and `shutdown`.
+- `manageEngineSession`: actions `status`, `restart`, `clear`, and `shutdown`.
 
 ## Discipline And Evidence
 

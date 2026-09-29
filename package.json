@@ -37,7 +37,7 @@
     "node": ">=20.11.0"
   },
   "scripts": {
-    "test": "node tests/contract.test.mjs && node tests/write-policy.test.mjs && node tests/search-order.test.mjs && node tests/engine-host.test.mjs && node tests/packaging.test.mjs"
+    "test": "node tests/contract.test.mjs && node tests/write-policy.test.mjs && node tests/search-order.test.mjs && node tests/engine-host.test.mjs && node tests/combo-slice.test.mjs && node tests/packaging.test.mjs"
   },
   "keywords": [
     "yugioh",

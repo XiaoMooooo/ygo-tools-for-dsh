@@ -234,11 +234,11 @@ function createWorkerEntryApi(deps) {
       runner = null;
       parentPort.close();
     };
-    const runExactShard = (shard, nodeBudget) => {
+    const runExactShard = async (shard, nodeBudget) => {
       let latestCheckpointResumeState = shard.resumeState ?? null;
       const searchStartNs = process.hrtime.bigint();
       snapshotState.clearCoreProfileStats();
-      const result = searchTopLongestPaths(runner, {
+      const result = await searchTopLongestPaths(runner, {
         maxDepth: job.maxDepth,
         maxNodes: nodeBudget,
         targetTerminals: job.targetTerminals,
@@ -319,7 +319,7 @@ function createWorkerEntryApi(deps) {
             }
             let shardPayload;
             try {
-              shardPayload = runExactShard(shard, nodeBudget);
+              shardPayload = await runExactShard(shard, nodeBudget);
             } catch (err) {
               const dumpPath = writeShardFailureDump(err, shard, nodeBudget, job, runner);
               const enriched = enrichShardError(err, shard, nodeBudget, job);
@@ -519,11 +519,11 @@ function createWorkerEntryApi(deps) {
       throw err;
     });
 
-    const runExactShard = (shard, nodeBudget) => {
+    const runExactShard = async (shard, nodeBudget) => {
       snapshotState.clearCoreProfileStats();
       const searchStartNs = process.hrtime.bigint();
       let latestCheckpointResumeState = null;
-      const result = searchTopLongestPaths(runner, {
+      const result = await searchTopLongestPaths(runner, {
         maxDepth: job.maxDepth,
         maxNodes: job.maxNodes,
         nodeBudget,
@@ -624,7 +624,7 @@ function createWorkerEntryApi(deps) {
           });
           let shardPayload;
           try {
-            shardPayload = runExactShard(shard, nodeBudget);
+            shardPayload = await runExactShard(shard, nodeBudget);
           } catch (err) {
             const dumpPath = writeShardFailureDump(err, shard, nodeBudget, job, runner);
             const enriched = enrichShardError(err, shard, nodeBudget, job);
@@ -667,7 +667,7 @@ function createWorkerEntryApi(deps) {
             let completedNodes = 0;
             let completedTerminals = 0;
             for (const shard of job.exactShards) {
-              const shardResult = searchTopLongestPaths(runner, {
+              const shardResult = await searchTopLongestPaths(runner, {
                 maxDepth: job.maxDepth,
                 maxNodes: job.maxNodes,
                 targetTerminals: job.targetTerminals,
@@ -705,7 +705,7 @@ function createWorkerEntryApi(deps) {
               { topPathPolicy: job.topPathPolicy ?? null },
             );
           } else {
-            result = searchTopLongestPaths(runner, {
+            result = await searchTopLongestPaths(runner, {
               maxDepth: job.maxDepth,
               maxNodes: job.maxNodes,
               targetTerminals: job.targetTerminals,

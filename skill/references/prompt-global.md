@@ -18,7 +18,7 @@ and produce reproducible route context.
 - Do not reimplement deck parsing, card lookup, action selection, response encoding, runner state, replay parsing, or checkpoints in model-authored code.
 - Native tool calls are already bound to one stable host session. Never create, choose, record, or pass a `sessionId`. For sequential games, call `resetGame`; use checkpoints for alternate embedded branches.
 - At the start of a continuation request, inspect `manageEngineSession`. If the session exists, continue it. Do not replay an expensive route from the beginning merely because a new model turn started.
-- Never clear engine state implicitly. Use `manageEngineSession` action `clear` with `confirm:true` only when the user requests a fresh session, and action `shutdown` only for explicit full teardown.
+- Never clear engine state implicitly. Use `manageEngineSession` action `clear` with `confirm:true` only when the user requests a fresh session, and action `shutdown` only for explicit full teardown. Action `restart` (no `confirm`) is the recovery path when the engine host is unreachable or keeps failing: the next call cold starts a fresh host, and live engine sessions are lost.
 - Only a direct DSH rejection saying `manageEngineSession` is unknown proves registration failure. If that occurs, stop and report it; there is no model-side fallback.
 - Never hand-parse YDK text. Read it as text and pass it unchanged to `manageSessionDeck({action:"set",ydk})`.
 

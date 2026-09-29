@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createYgoBackend } from './factory.mjs';
+import { resolveEngineTokenFilePath } from './engine-token.mjs';
 import {
   getPublicToolInputSchema,
   PUBLIC_TOOL_ACTIONS,
@@ -31,6 +32,33 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
   const sessions = new Map();
   const sessionLastUsedAt = new Map();
   const idleTimeoutMs = hostOptions.idleTimeoutMs ?? resolveSessionIdleTimeoutMs();
+  // The engine server passes the address it actually listens on. The fallbacks
+  // only matter for an in-process host (schema inspection), which never serves
+  // a live engine call.
+  const hostAddress = asRecord(hostOptions.engineHost);
+  const engineHostname = readString(hostAddress.hostname)
+    ?? readString(process.env.YGO_ENGINE_HOST)
+    ?? '127.0.0.1';
+  const enginePort = normalizeHostPort(hostAddress.port ?? process.env.YGO_ENGINE_HOST_PORT);
+
+  /**
+   * Connection facts a client can use to tell "the host answered" from "the
+   * host is gone": same field names the client reports when it cannot reach
+   * the host at all, so `manageEngineSession` is consistent either way.
+   */
+  function engineHostStatus() {
+    return {
+      reachable: true,
+      hostname: engineHostname,
+      port: enginePort,
+      // Same resolution the client reports: the path the shared token is read
+      // from or written to (the client hands this host its token through the
+      // environment, but the persisted file is still where it lives).
+      tokenPath: resolveEngineTokenFilePath(process.env),
+      lastError: null,
+      needsRestart: false,
+    };
+  }
 
   function touchSession(id) {
     sessionLastUsedAt.set(id, Date.now());
@@ -155,8 +183,30 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
           exists: Boolean(session),
           sessionCount: sessions.size,
           ...summarizeEngineSession(session),
+          ...engineHostStatus(),
         },
       };
+    }
+    if (action === 'restart') {
+      // A running host can only perform the shutdown half of a restart: it
+      // releases its sessions and stops, and the client that asked for the
+      // restart cold starts a fresh host on its next call. Doing it here keeps
+      // one restart path for both the client and a direct HTTP caller.
+      const clearedSessionCount = sessions.size;
+      for (const session of sessions.values()) disposeSession(session);
+      sessions.clear();
+      const result = {
+        ok: true,
+        data: {
+          action: 'restart-host',
+          clearedSessionCount,
+          ...engineHostStatus(),
+          restarting: true,
+          note: 'The engine host stops now; the next YGO tool call cold starts a fresh one.',
+        },
+      };
+      if (typeof hostOptions.onShutdown === 'function') setImmediate(() => hostOptions.onShutdown(result));
+      return result;
     }
     if (action !== 'clear' && action !== 'shutdown') {
       // Without this guard any unrecognized action that happened to pass the
@@ -165,7 +215,7 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
         ok: false,
         code: 'INVALID_ACTION',
         error: `Unknown engine session action ${JSON.stringify(action ?? null)}.`,
-        data: { availableActions: ['status', 'clear', 'shutdown'] },
+        data: { availableActions: ['status', 'restart', 'clear', 'shutdown'] },
       };
     }
     if (input.confirm !== true) {
@@ -362,6 +412,11 @@ function normalizeSessionId(value) {
 
 function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function normalizeHostPort(value) {
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
 }
 
 function asRecord(value) {
