@@ -6754,6 +6754,7 @@ async function runSingleSearchJob(job) {
       checkpointEvery: job.checkpointEvery,
       exactSearchBackend: job.exactSearchBackend ?? 'js',
       topPathPolicy: job.topPathPolicy,
+      onStateVisit: job.onStateVisit,
       resumeState: job.resumeState,
       searchStartedAtMs: job.searchStartedAtMs ?? job.startedAtMs,
       debugTrace: job.debugTrace,
@@ -6879,6 +6880,48 @@ function collapsePlacementVariants(topPaths, requestedTopK) {
 }
 
 /**
+ * Summarize what `measureStates` observed.
+ *
+ * `visits` counts node visits and `distinctStates` counts different positions, so
+ * the gap between them is exactly the work a transposition table would remove.
+ * The terminal figures matter most: a repeated terminal is one position reported
+ * as several results, which is what inflates `terminalCount` and fills top-K with
+ * order permutations of a single line.
+ *
+ * @param {Map<string, { count: number, terminalCount: number, depth: number }>} stateVisits
+ */
+function summarizeStateVisits(stateVisits) {
+  let visits = 0;
+  let terminalVisits = 0;
+  let distinctTerminalStates = 0;
+  let repeatedStates = 0;
+  let worstRepeat = 0;
+  for (const record of stateVisits.values()) {
+    visits += record.count;
+    if (record.count > 1) repeatedStates += 1;
+    if (record.count > worstRepeat) worstRepeat = record.count;
+    if (record.terminalCount > 0) {
+      terminalVisits += record.terminalCount;
+      distinctTerminalStates += 1;
+    }
+  }
+  const distinctStates = stateVisits.size;
+  return {
+    visits,
+    distinctStates,
+    duplicateVisits: visits - distinctStates,
+    duplicateRate: visits > 0 ? Number(((visits - distinctStates) / visits).toFixed(4)) : 0,
+    repeatedStates,
+    worstRepeat,
+    terminalVisits,
+    distinctTerminalStates,
+    terminalDuplicateRate: terminalVisits > 0
+      ? Number(((terminalVisits - distinctTerminalStates) / terminalVisits).toFixed(4))
+      : 0,
+  };
+}
+
+/**
  * Search engine-verified combo routes for one deck and one opening.
  *
  * This is the narrow entry point a model-facing tool calls. It deliberately skips
@@ -6922,6 +6965,21 @@ async function runComboRouteSearch(options) {
     ? Math.trunc(Number(options.diversityCap))
     : 3;
 
+  // Measurement-only. The collected set never feeds pruning, so turning this on
+  // cannot change a single search decision; it only reports how much of the node
+  // budget is spent revisiting positions the search has already been in.
+  const stateVisits = options.measureStates === true ? new Map() : null;
+  const collectStateVisit = stateVisits
+    ? (key, meta) => {
+        if (typeof key !== 'string' || key.length === 0) return;
+        const record = stateVisits.get(key) ?? { count: 0, terminalCount: 0, depth: 0 };
+        record.count += 1;
+        if (meta?.terminal) record.terminalCount += 1;
+        record.depth = Math.max(record.depth, Number(meta?.depth) || 0);
+        stateVisits.set(key, record);
+      }
+    : null;
+
   const job = {
     cardsPath: resourcePaths.cardsPath,
     scriptDirs: resourcePaths.scriptDirs,
@@ -6956,6 +7014,7 @@ async function runComboRouteSearch(options) {
     yrpVersion: options.yrpVersion === 1 ? 1 : 2,
     progressEvery: positiveInt(options.progressEvery, 0),
     onProgress: typeof options.onProgress === 'function' ? options.onProgress : null,
+    onStateVisit: collectStateVisit,
     profileCore: false,
     verbose: options.verbose === true,
     searchStartedAtMs: Date.now(),
@@ -6964,10 +7023,12 @@ async function runComboRouteSearch(options) {
   const { result, searchElapsedMs, initialPlayerHand } = await runSingleSearchJob(job);
   const topPaths = Array.isArray(result?.topPaths) ? result.topPaths : [];
   const { routes, collapsed } = collapsePlacementVariants(topPaths, requestedTopK);
+  const stateStats = stateVisits ? summarizeStateVisits(stateVisits) : null;
   return {
     openingCodes: playerOpening.opening.slice(),
     openingRemainCount: playerOpening.remain.length,
     initialPlayerHand,
+    ...(stateStats ? { stateStats } : {}),
     routes,
     routesConsidered: topPaths.length,
     routesCollapsedAsPlacementVariants: collapsed,

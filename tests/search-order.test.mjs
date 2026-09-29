@@ -157,4 +157,11 @@ t.check('the tie-break no longer reads wall-clock discovery time',
 t.check('the tie-break is based on node counts',
   /function routeFoundSortValue[\s\S]{0,220}routeFoundNodes/.test(searchSource), true);
 
+t.section('card reading is not truncated where rulings depend on wording');
+const cardToolsSource = readFileSync(`${ROOT}/skill/runtime/src/tools/card-tools.js`, 'utf8');
+t.assert('search results carry the untruncated effect text',
+  /effectText: card\.effectText/.test(cardToolsSource));
+t.assert('the query-centred snippet is still available separately',
+  /effectSnippet: buildEffectSnippet/.test(cardToolsSource));
+
 t.finish();

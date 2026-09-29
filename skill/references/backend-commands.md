@@ -63,3 +63,19 @@ request. A saved file is not proof that a combo completed or won.
 Card claims require `queryCards`; deck claims require `manageSessionDeck` or
 current-deck card evidence; state and legality claims require current duel tool
 output; replay claims are limited to `analyzeReplay` output.
+
+## Tooling Discipline
+
+- `analyzeReplay` parses `.yrp`, `.yrp2` and `.yrp3d` **offline**: it starts its own
+  embedded engine and needs neither a live YGOPro2 bridge nor a duel runner. Never
+  parse a replay by hand, and never copy the skill or build your own harness.
+- `expandCombo` runs the engine's own search inside the engine host. Use it instead
+  of writing a search script. If a tool cannot do what is needed, report the
+  limitation rather than working around it.
+- **Negative observations only count when they come from these tools.** "The engine
+  does not offer this action" is evidence only from a normal session. A hand-built
+  harness auto-answers prompts and manipulates state, so its negatives are false
+  negatives — never turn one into a rule.
+- Rules that hang on wording — cost versus effect, optional 「才能发动」 versus a
+  mandatory trigger, 「時」 versus 「場合」 — must be settled from the card text and
+  the tool output, never inferred from a summary of them.

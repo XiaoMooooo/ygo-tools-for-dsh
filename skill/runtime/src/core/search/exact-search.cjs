@@ -557,10 +557,10 @@ function createExactSearchApi(deps) {
     ].includes(decision.reason);
   }
 
-  function buildCurrentDecisionStateKey(runner) {
+  function buildCurrentDecisionStateKey(runner, force = false) {
     if (!runner) return '';
     const decision = runner.currentDecision ?? null;
-    if (!shouldBuildExactCycleStateKey(decision)) return '';
+    if (!force && !shouldBuildExactCycleStateKey(decision)) return '';
     let logicalStateKey = '';
     if (typeof runner.captureSnapshot === 'function') {
       try {
@@ -787,6 +787,10 @@ function createExactSearchApi(deps) {
     const progressEvery = Math.max(1, opts.progressEvery ?? 200);
     const progressMinIntervalMs = Math.max(100, opts.progressMinIntervalMs ?? 500);
     const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+    // Measurement-only hook. It observes every visited state so callers can size
+    // the duplication the search currently pays for; it never feeds the pruning
+    // logic, so enabling it cannot change a single search decision.
+    const onStateVisit = typeof opts.onStateVisit === 'function' ? opts.onStateVisit : null;
     const onCheckpoint = typeof opts.onCheckpoint === 'function' ? opts.onCheckpoint : null;
     const checkpointEvery = Math.max(1, opts.checkpointEvery ?? WEB_ARCHIVE_CHECKPOINT_NODES);
     // 已废弃节点判定。checkpointEvery 仅保留在选项签名上以维持调用方兼容,实际不再用于判定。
@@ -1344,6 +1348,9 @@ function createExactSearchApi(deps) {
           };
         }
 
+        if (onStateVisit) {
+          onStateVisit(buildCurrentDecisionStateKey(runner, true), { depth, terminal: false, reason: null });
+        }
         const forcedAction = sortedActions[0];
         runner.step(forcedAction);
         best.nodes += 1;
@@ -1500,6 +1507,15 @@ function createExactSearchApi(deps) {
         emitCheckpoint();
         maybeReportProgress(frame.depth);
         continue;
+      }
+      if (onStateVisit) {
+        // One record per consumed node: the children of a branch frame are the
+        // other large share of the budget besides the forced chains.
+        onStateVisit(buildCurrentDecisionStateKey(runner, true), {
+          depth: frame.depth,
+          terminal: !!runner.currentDecision?.terminal,
+          reason: runner.currentDecision?.reason ?? null,
+        });
       }
       runner.step(action);
       best.nodes += 1;

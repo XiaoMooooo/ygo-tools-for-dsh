@@ -21,7 +21,7 @@ import {
 /** @typedef {{ ok: true, data: CardEffectSummary } | { ok: false, error: string }} GetCardEffectResult */
 /** @typedef {'all' | 'name' | 'text'} SearchMode */
 /** @typedef {{ query?: string, cardName?: string, name?: string, keyword?: string, text?: string, mode?: string, searchMode?: string, type?: TypeFilter, cardType?: TypeFilter, limit?: number, dbPath?: string, cardsDb?: CardsDbLike }} SearchCardsInput */
-/** @typedef {{ id: number, name: string, type: string, typeTags: string[], attribute: string | null, race: string | null, atk: number | null, def: number | null, atkText: string, defText: string, level: number, effectSnippet: string, currentDeck: CurrentDeckMembership | null, banlistStatus: BanlistStatusSummary | null, scriptStatus: ScriptStatusSummary | null }} CardSearchSummary */
+/** @typedef {{ id: number, name: string, type: string, typeTags: string[], attribute: string | null, race: string | null, atk: number | null, def: number | null, atkText: string, defText: string, level: number, effectText: string, effectSnippet: string, currentDeck: CurrentDeckMembership | null, banlistStatus: BanlistStatusSummary | null, scriptStatus: ScriptStatusSummary | null }} CardSearchSummary */
 /** @typedef {{ query: string, expandedQueries: string[], mode: SearchMode, type: TypeFilter | null, limit: number, dataSource: { dbPath: string | null }, returnedResults: number, limitReached: boolean, currentDeck: { deckLoaded: boolean, matchingResults: number, missingResults: number } | null, results: CardSearchSummary[] }} SearchCardsSummary */
 /** @typedef {{ ok: true, data: SearchCardsSummary } | { ok: false, error: string }} SearchCardsResult */
 
@@ -260,6 +260,11 @@ function formatCardSearchSummary(card, queries, meta) {
     atkText: formatStat(card.atk),
     defText: formatStat(card.def),
     level: card.level,
+    // Full text, deliberately untruncated: rulings turn on wording ("才能发动" is
+    // optional, a cost sits before the colon, 「時」 can miss timing), and the
+    // windowed snippet below hides exactly that wording. A truncated effect is how
+    // a model ends up asserting a rule the card does not support.
+    effectText: card.effectText,
     effectSnippet: buildEffectSnippet(card, queries),
     currentDeck: buildCurrentDeckMembership(card, meta.deck, meta.cardsDb),
     banlistStatus: formatBanlistStatus(card),

@@ -108,6 +108,17 @@ for (const name of PUBLIC_TOOL_NAMES) {
   t.assert(`${name}: declares a description`, typeof PUBLIC_TOOL_DESCRIPTIONS?.[name] === 'string');
 }
 
+t.section('tool descriptions carry the rules models get wrong');
+// Both failures seen in the wild trace back to a description that did not say the
+// tool could do the job, so the model built its own harness instead.
+t.assert('analyzeReplay states it parses .yrp3d offline',
+  /offline/.test(PUBLIC_TOOL_DESCRIPTIONS.analyzeReplay)
+  && /\.yrp3d/.test(PUBLIC_TOOL_DESCRIPTIONS.analyzeReplay));
+t.assert('analyzeReplay forbids parsing replays by hand',
+  /never parse a replay by hand/i.test(PUBLIC_TOOL_DESCRIPTIONS.analyzeReplay));
+t.assert('expandCombo says to use it instead of a custom harness',
+  /harness/.test(PUBLIC_TOOL_DESCRIPTIONS.expandCombo));
+
 t.section('requirements the DSL cannot express are still explained to the model');
 // A root anyOf is enforced engine-side only; the model reads property
 // descriptions, so every selector named by such a requirement must describe it.
