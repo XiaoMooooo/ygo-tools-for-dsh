@@ -39,6 +39,9 @@ const CORE_MODULES = Object.freeze({
   comboSimulator: 'combo-simulator.cjs',
   // Pure dependency planner: no engine, no session, so it needs no runner.
   routePlanner: 'src/core/search/route-planner.cjs',
+  // Pure position-key projection behind the `measureStates` statistics. Same
+  // reason: no engine, no session.
+  stateKeys: 'src/core/search/state-keys.cjs',
 });
 
 const CURRENT_DUEL_RULE = 5;
@@ -62,6 +65,14 @@ const COMBO_YIELD_EVERY_NODES = 64;
 // the most recent jobs is what stops a long-lived host from accumulating them.
 const DEFAULT_COMBO_JOB_CAP = 8;
 const MAX_COMBO_JOB_CAP = 64;
+// How many times one continuation chain may be extended. This is a runaway-loop
+// guard, not a performance fix: the job store cap bounds how many chains exist,
+// not how long a single chain may run, so `expandCombo({jobId})` in a loop could
+// otherwise hold a session's search budget forever. It is deliberately high — 32
+// slices is 8 minutes at the 15 s default — so an ordinary multi-slice search never
+// meets it, and the refusal is explicit rather than a silent truncation.
+export const DEFAULT_COMBO_MAX_CONTINUATIONS = 32;
+export const MAX_COMBO_MAX_CONTINUATIONS = 512;
 
 const CORE_TOOL_NAMES = Object.freeze([
   'getCardEffect',
@@ -869,6 +880,10 @@ function comboJobCap() {
   return Math.min(Math.trunc(parsed), MAX_COMBO_JOB_CAP);
 }
 
+function comboContinuationLimit() {
+  return resolveComboMaxContinuations();
+}
+
 function dropComboSearchJob(jobId) {
   return comboSearchJobs.delete(jobId);
 }
@@ -893,10 +908,33 @@ function takeComboSearchJob(jobId) {
   return job;
 }
 
+/**
+ * Same draw inputs, in the same order. Order matters: a fixed opening is a hand,
+ * not a set, so `[a, b]` and `[b, a]` are different openings.
+ */
+function sameOpeningCodes(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false;
+  }
+  return true;
+}
+
 export function resolveComboTimeSliceMs(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_COMBO_TIME_SLICE_MS;
   return Math.min(Math.trunc(parsed), MAX_COMBO_TIME_SLICE_MS);
+}
+
+/**
+ * How many continuations one job chain may spend, from `YGO_COMBO_MAX_CONTINUATIONS`.
+ *
+ * Exported so the resolution rules can be asserted without running 33 searches.
+ */
+export function resolveComboMaxContinuations(value = process.env.YGO_COMBO_MAX_CONTINUATIONS) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_COMBO_MAX_CONTINUATIONS;
+  return Math.min(Math.trunc(parsed), MAX_COMBO_MAX_CONTINUATIONS);
 }
 
 /**
@@ -941,6 +979,12 @@ async function expandComboRoutes(context, input, config, moduleCache) {
     };
   }
   let resumeJob = null;
+  // How many continuations this chain has already spent to reach the job being
+  // continued. Counted on the job, not on the caller: a model can start a new chain
+  // whenever it wants, but a chain cannot extend itself forever without saying so.
+  // The fresh case is 0, and the reply reports the new depth (`spent + 1`), so the
+  // first slice of a chain reads 0 and its first continuation reads 1.
+  let continuationsSpent = 0;
   if (requestedJobId) {
     resumeJob = takeComboSearchJob(requestedJobId);
     if (!resumeJob) {
@@ -951,7 +995,28 @@ async function expandComboRoutes(context, input, config, moduleCache) {
         data: { jobId: requestedJobId, retainedJobCount: comboSearchJobs.size },
       };
     }
+    continuationsSpent = Math.max(0, Math.trunc(Number(resumeJob.continuations) || 0));
+    // Runaway-loop guard. A chain that has already been continued this many times
+    // is refused *before* any search runs, and dropped rather than retained: the
+    // caller has to start a new search if it really wants more, which makes the
+    // extra work a decision instead of an accident.
+    const limit = comboContinuationLimit();
+    if (continuationsSpent >= limit) {
+      dropComboSearchJob(requestedJobId);
+      return {
+        ok: false,
+        code: 'COMBO_CONTINUATION_LIMIT',
+        error: `This expandCombo job chain has already been continued ${continuationsSpent} time(s), which is the limit (continuationLimit=${limit}, YGO_COMBO_MAX_CONTINUATIONS). It was dropped instead of searching again: start a fresh expandCombo call, or raise the limit if the loop is intended.`,
+        data: {
+          jobId: requestedJobId,
+          continuations: continuationsSpent,
+          continuationLimit: limit,
+          retainedJobCount: comboSearchJobs.size,
+        },
+      };
+    }
   }
+  const continuationsNow = resumeJob ? continuationsSpent + 1 : 0;
   if (record.resumeState !== undefined) {
     // The resume payload is host-private by design; accepting it from the model
     // would put the whole DFS stack back into the payload it was moved out of.
@@ -981,13 +1046,41 @@ async function expandComboRoutes(context, input, config, moduleCache) {
   const requestedTimeSliceMs = Number.isFinite(Number(record.timeSliceMs)) && Number(record.timeSliceMs) > 0
     ? Math.trunc(Number(record.timeSliceMs))
     : null;
+  // Draw inputs belong to the job, not to the call that continues it. A
+  // continuation that re-derived them searched a different hand from a different
+  // seed and then attributed those routes to a job created for another opening, so
+  // a continuation always takes the job's own values.
+  const suppliedOpeningCodes = Array.isArray(record.openingCodes)
+    ? record.openingCodes.map((value) => Number(value) >>> 0).filter((value) => value > 0)
+    : null;
+  const suppliedSeed = record.seed === undefined ? null : Number(record.seed) >>> 0;
+  const suppliedDrawCount = record.drawCount === undefined ? null : Number(record.drawCount);
+  const jobSeed = resumeJob && Number.isFinite(Number(resumeJob.seed)) ? Number(resumeJob.seed) >>> 0 : null;
+  const jobOpeningCodes = resumeJob && Array.isArray(resumeJob.openingCodes) ? resumeJob.openingCodes.slice() : null;
+  const jobDrawCount = resumeJob && Number.isFinite(Number(resumeJob.drawCount)) ? Math.trunc(Number(resumeJob.drawCount)) : null;
+  // Policy for conflicting caller-supplied draw inputs on a continuation: ignore
+  // them and report it. The job's values win, because the routes being added
+  // belong to that opening; obeying a new seed or hand here would silently
+  // mis-attribute them. An empty `openingCodes` list means "let the engine draw",
+  // so it is not a conflict.
+  const ignoredDrawInputs = [];
+  if (resumeJob) {
+    if (suppliedSeed !== null && jobSeed !== null && suppliedSeed !== jobSeed) {
+      ignoredDrawInputs.push({ name: 'seed', supplied: suppliedSeed, used: jobSeed });
+    }
+    if (suppliedOpeningCodes !== null && suppliedOpeningCodes.length > 0 && jobOpeningCodes !== null
+      && !sameOpeningCodes(suppliedOpeningCodes, jobOpeningCodes)) {
+      ignoredDrawInputs.push({ name: 'openingCodes', supplied: suppliedOpeningCodes, used: jobOpeningCodes });
+    }
+    if (suppliedDrawCount !== null && jobDrawCount !== null && suppliedDrawCount !== jobDrawCount) {
+      ignoredDrawInputs.push({ name: 'drawCount', supplied: suppliedDrawCount, used: jobDrawCount });
+    }
+  }
   const result = await searchComboRoutes({
     playerDeck,
-    openingCodes: Array.isArray(record.openingCodes)
-      ? record.openingCodes.map((value) => Number(value) >>> 0).filter((value) => value > 0)
-      : [],
-    seed: record.seed === undefined ? undefined : Number(record.seed) >>> 0,
-    drawCount: record.drawCount,
+    openingCodes: resumeJob ? (jobOpeningCodes ?? []) : (suppliedOpeningCodes ?? []),
+    seed: resumeJob ? (jobSeed ?? undefined) : (suppliedSeed ?? undefined),
+    drawCount: resumeJob ? (jobDrawCount ?? undefined) : record.drawCount,
     maxNodes: record.maxNodes,
     maxDepth: record.maxDepth,
     topK: record.topK,
@@ -996,11 +1089,19 @@ async function expandComboRoutes(context, input, config, moduleCache) {
     timeBudgetMs: timeSliceMs,
     yieldEveryNodes: COMBO_YIELD_EVERY_NODES,
     resumeState: resumeJob?.resumeState ?? undefined,
+    // Statistics only, and only when asked for: the search itself never reads it.
+    measureStates: record.measureStates === true,
   });
   if (result?.ok !== true) {
     return { ok: false, code: 'SEARCH_FAILED', error: readString(result?.error) ?? 'combo search failed' };
   }
   const data = asRecord(result.data);
+  // `stateStats` is the runtime's own name for the numbers; the model-facing
+  // response spells the same block `statistics` and never carries the raw name.
+  // `revisitedNodes` is surfaced once, inside `slice`, next to the node accounting
+  // it belongs with, rather than twice at two depths of the same reply.
+  const { stateStats, revisitedNodes: sliceRevisitedNodes, ...publicData } = data;
+  const statistics = record.measureStates === true && stateStats ? asRecord(stateStats) : null;
   const nodesSoFar = Number(data.nodes) || 0;
   const completed = data.completed === true;
   const stopReason = readString(data.stopReason) ?? 'UNKNOWN';
@@ -1019,24 +1120,59 @@ async function expandComboRoutes(context, input, config, moduleCache) {
       createdAt: Date.now(),
       deckName: readString(session.metadata.currentDeckName) ?? null,
       timeSliceMs,
+      // The draw inputs this slice actually searched with, echoed by the engine.
+      // Storing them is what makes a continuation the same opening rather than a
+      // fresh draw: they are read back above and sent unchanged to the next slice.
+      seed: Number.isFinite(Number(data.seed)) ? Number(data.seed) >>> 0 : jobSeed,
+      openingCodes: Array.isArray(data.openingCodes)
+        ? data.openingCodes.map((value) => Number(value) >>> 0)
+        : (jobOpeningCodes ?? []),
+      drawCount: Number.isFinite(Number(data.drawCount)) ? Math.trunc(Number(data.drawCount)) : jobDrawCount,
+      // This slice is one continuation further along than the one it came from.
+      continuations: continuationsNow,
     });
   }
+  const sliceNote = resumable
+    ? `${stopReason === 'TIME_SLICE'
+        ? `The search used its whole ${timeSliceMs} ms slice`
+        : `The search stopped at a budget boundary`} (stopReason=${stopReason}) and returned partial routes. Call expandCombo({ jobId: "${jobId}" }) to continue from here; call expandCombo({ jobId: "${jobId}", cancel: true }) when done.`
+    : null;
+  // Only said when something was actually overruled: a continuation that named a
+  // different seed or hand must never look like it obeyed them.
+  const ignoredDrawNote = ignoredDrawInputs.length > 0
+    ? `Ignored the caller-supplied ${ignoredDrawInputs.map((entry) => entry.name).join('/')} on this continuation: the job's own draw inputs (${ignoredDrawInputs.map((entry) => `${entry.name}=${JSON.stringify(entry.used)}`).join(', ')}) were used, so the same opening stays under search.`
+    : null;
   return {
     ok: true,
     data: {
       action: 'expandCombo',
       deckSource: sessionDeck ? 'session' : 'ydk',
       deckName: readString(session.metadata.currentDeckName) ?? null,
-      ...data,
+      ...publicData,
+      // Present only when `measureStates: true` was asked for. Statistics only:
+      // nothing in the search reads these numbers back, so the routes are the same
+      // with the block as without it.
+      ...(statistics ? { statistics } : {}),
       // Slice accounting uses the existing stopReason/completed vocabulary; these
       // fields only say which budget ran out and what is left of it. `nodes` stays
       // the cumulative total so a continued slice is visibly larger, not a repeat.
       jobId,
       resumable,
       continuedFromJobId: resumeJob ? requestedJobId : null,
+      // Where this slice's draw inputs came from, and what was overruled to get
+      // them. A continuation reports `job` and echoes the job's own seed and
+      // opening choices unchanged.
+      drawInputsSource: resumeJob ? 'job' : 'request',
+      ...(ignoredDrawInputs.length > 0 ? { ignoredDrawInputs } : {}),
       nodesSoFar,
       ordersTruncated: !completed,
       retainedJobCount: comboSearchJobs.size,
+      // How far along the continuation chain this reply sits, and the cap on it.
+      // `continuations` counts the continuations spent *including this call*, so a
+      // fresh search reads 0 and its first continuation reads 1: a caller can tell
+      // "I have continued this chain 3 times out of 32" without tracking it.
+      continuations: continuationsNow,
+      continuationLimit: comboContinuationLimit(),
       slice: {
         timeSliceMs,
         // Only when it differs, so a request clamped to MAX_COMBO_TIME_SLICE_MS is
@@ -1048,14 +1184,40 @@ async function expandComboRoutes(context, input, config, moduleCache) {
         maxNodes: Number(data.budget?.maxNodes) || null,
         nodesAtSliceStart: Number(data.nodesAtSliceStart) || 0,
         nodesThisSlice: Number(data.nodesThisSlice) || 0,
+        // Engine steps this slice re-executed to rebuild positions it had already
+        // reached (frame-restore history replays). `nodesThisSlice` is the newly
+        // extended work; these two together are what the slice actually paid for.
+        // Not every restore replays: one satisfied from the runner's snapshot pool
+        // costs no history steps and is counted as 0.
+        revisitedNodes: Number(sliceRevisitedNodes) || 0,
       },
-      note: resumable
-        ? `${stopReason === 'TIME_SLICE'
-            ? `The search used its whole ${timeSliceMs} ms slice`
-            : `The search stopped at a budget boundary`} (stopReason=${stopReason}) and returned partial routes. Call expandCombo({ jobId: "${jobId}" }) to continue from here; call expandCombo({ jobId: "${jobId}", cancel: true }) when done.`
-        : null,
+      note: [sliceNote, statistics ? describeStateStatistics(statistics) : null, ignoredDrawNote].filter(Boolean).join(' ') || null,
     },
   };
+}
+
+/**
+ * One human-readable line about the measured duplication.
+ *
+ * The interesting number is not the duplicate rate itself but the shape of the
+ * top-K: how many of the routes handed back are actually the same terminal reached
+ * a different way. Those are the ones a reader would otherwise count as distinct
+ * lines.
+ *
+ * Exported so the wording can be asserted without running a search.
+ */
+export function describeStateStatistics(statistics) {
+  const topK = asRecord(asRecord(statistics).topK);
+  const routes = Number(topK.routes) || 0;
+  const distinctTerminals = Number(topK.distinctTerminals) || 0;
+  const largestVariants = Number(topK.largestVariants) || 0;
+  if (routes === 0) return 'No route reached a terminal, so there is nothing to group.';
+  const orderNote = largestVariants > 1
+    ? `; the largest group has ${largestVariants} that differ only in order`
+    : '';
+  const routeText = routes === 1 ? '1 route lands' : `${routes} routes land`;
+  const terminalText = distinctTerminals === 1 ? '1 distinct terminal' : `${distinctTerminals} distinct terminals`;
+  return `${routeText} on ${terminalText}${orderNote}.`;
 }
 
 /**

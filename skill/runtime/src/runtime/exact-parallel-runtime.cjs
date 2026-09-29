@@ -297,16 +297,40 @@ function createExactParallelRuntimeApi(deps) {
     return Math.max(1, Math.min(Math.max(1, requestedWorkers | 0), cpuCap));
   }
 
-  function shouldUseParallelExactSearch(job) {
-    const resumeState = job?.resumeState;
-    const isParallelResume = isParallelExactResumeState(resumeState);
-    return !!job?.exactSingleSearch &&
+  /**
+   * Why the parallel exact backend is or is not used, as data instead of a bare
+   * boolean.
+   *
+   * `targetTerminals > 0` disables sharded parallelism outright and used to do it
+   * silently: a caller that asked for workers got one serial search and nothing in
+   * the reply said so. The decision is returned as a reason code now, so the search
+   * can report `parallelism {requested, active, disabledReason}` and the caller
+   * never has to infer it from a timing difference.
+   *
+   * @param {object} job
+   * @returns {{ requested: boolean, active: boolean, disabledReason: string|null, workers: number }}
+   */
+  function describeParallelExactSearch(job) {
+    const workers = Math.max(1, job?.workers | 0);
+    const requested = job?.exactSingleSearch === true &&
       job?.engineBackend !== 'native' &&
       job?.exactSearchBackend === 'parallel-js' &&
-      Math.max(1, job?.workers | 0) > 1 &&
-      (!resumeState || isParallelResume) &&
-      !Array.isArray(job?.exactShards) &&
-      !(job?.targetTerminals > 0);
+      workers > 1;
+    if (!requested) return { requested: false, active: false, disabledReason: null, workers };
+    const resumeState = job?.resumeState;
+    // Order matters only for readability: each of these makes the parallel path
+    // impossible on its own, and the first one that applies is the one reported.
+    const disabledReason = (resumeState && !isParallelExactResumeState(resumeState))
+      ? 'incompatible-resume-state'
+      : (Array.isArray(job?.exactShards) ? 'pre-split-shards'
+        : (job?.targetTerminals > 0 ? 'target-terminals' : null));
+    return { requested: true, active: disabledReason === null, disabledReason, workers };
+  }
+
+  function shouldUseParallelExactSearch(job) {
+    // One source of truth: the boolean is the descriptor's `active`, so a reason
+    // can never be reported while the decision disagrees with it.
+    return describeParallelExactSearch(job).active;
   }
 
   function splitExactShardsAcrossWorkers(shards, workerCount) {
@@ -1193,6 +1217,7 @@ function createExactParallelRuntimeApi(deps) {
 
   return {
     getAvailableWorkerCount,
+    describeParallelExactSearch,
     shouldUseParallelExactSearch,
     splitExactShardsAcrossWorkers,
     isParallelExactResumeState,

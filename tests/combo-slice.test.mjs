@@ -54,6 +54,10 @@ const CLIENT_STARTUP_TIMEOUT_MS = 30000;
 // starting nine real searches. One retained job holds a serialized DFS stack, so
 // an unbounded store is the failure this bound exists to prevent.
 const JOB_CAP = 3;
+// How many times one chain may be continued before it is refused. Two is enough to
+// exercise the refusal against the continuations this suite already performs, and
+// the refusal itself runs no search: it is decided before the engine is touched.
+const MAX_CONTINUATIONS = 2;
 
 rmSync(DATA, { recursive: true, force: true });
 
@@ -66,6 +70,7 @@ const child = spawn(process.execPath, [SERVER, '--host', '127.0.0.1', '--port', 
     ...process.env,
     YGO_ENGINE_TOKEN: TOKEN,
     YGO_COMBO_JOB_CAP: String(JOB_CAP),
+    YGO_COMBO_MAX_CONTINUATIONS: String(MAX_CONTINUATIONS),
     YGO_CACHE_DIR: join(DATA, 'cache'),
   },
   stdio: 'ignore',
@@ -137,6 +142,15 @@ try {
   t.assert('  consuming no more than the budget plus a small overshoot',
     Number(firstData.slice?.consumedMs) <= SHORT_SLICE_MS * 1.5,
     `consumed=${firstData.slice?.consumedMs} budget=${SHORT_SLICE_MS}`);
+  // Re-walk accounting. `nodesThisSlice` is newly extended work; `revisitedNodes`
+  // is engine work spent re-executing positions this chain had already reached.
+  // The counter is reported by the runner, so the only shape this suite can pin is
+  // that it is present and sane on both a fresh slice and a continuation.
+  t.assert('  and the re-walk accounting is present',
+    Number.isInteger(firstData.slice?.revisitedNodes) && firstData.slice.revisitedNodes >= 0,
+    JSON.stringify(firstData.slice));
+  t.check('  which starts at zero continuations', firstData.continuations, 0);
+  t.check('  and names the cap on this chain', firstData.continuationLimit, MAX_CONTINUATIONS);
 
   t.section('the resume state stays on the host');
   const firstPayload = JSON.stringify(first);
@@ -153,7 +167,11 @@ try {
   t.assert('  one job is retained on the host', retainedAfterFirst >= 1, String(retainedAfterFirst));
 
   t.section('continuing a job adds nodes instead of repeating the root');
-  const second = await search({ maxNodes: 100000, timeSliceMs: SHORT_SLICE_MS, jobId: firstData.jobId });
+  // Only the job id is passed: the deck still has to come from ydk, but the seed and
+  // the opening must come back from the job rather than from this call.
+  const second = await call('expandCombo', {
+    ydk: YDK, maxDepth: 40, maxNodes: 100000, timeSliceMs: SHORT_SLICE_MS, jobId: firstData.jobId,
+  });
   const secondData = second.result?.data ?? {};
   t.check('the continued call succeeds', second.ok, true);
   t.assert('the cumulative node count grew',
@@ -167,6 +185,85 @@ try {
   t.check('  and it reports the job it continued from', secondData.continuedFromJobId, firstData.jobId);
   t.check('  the continuation is resumable again', secondData.resumable, true);
   t.assert('  with a fresh job id', secondData.jobId !== firstData.jobId, String(secondData.jobId));
+  // Same call, same seed, but the second slice was never told the seed or the hand:
+  // both have to come back from the job, unchanged.
+  t.check('  and the job seed comes back unchanged', secondData.seed, firstData.seed);
+  t.check('  and so does the opening it searched',
+    JSON.stringify(secondData.openingCodes), JSON.stringify(firstData.openingCodes));
+  t.check('  and the hand the engine was rebuilt on',
+    JSON.stringify(secondData.initialPlayerHand), JSON.stringify(firstData.initialPlayerHand));
+  t.check('  with the draw inputs attributed to the job', secondData.drawInputsSource, 'job');
+  t.check('  and one continuation spent', secondData.continuations, 1);
+  t.assert('  with the re-walk accounting present on a continuation too',
+    Number.isInteger(secondData.slice?.revisitedNodes) && secondData.slice.revisitedNodes >= 0,
+    JSON.stringify(secondData.slice));
+  t.note(`slice 1: this=${firstData.slice?.nodesThisSlice} revisited=${firstData.slice?.revisitedNodes} | `
+    + `slice 2: this=${secondData.slice?.nodesThisSlice} revisited=${secondData.slice?.revisitedNodes}`);
+
+  t.section('a continuation keeps the opening its job was created for');
+  // The defect: the job held only the resume state, so every continuation re-derived
+  // the seed and the opening. It searched a different hand, and the routes it found
+  // were attributed to a job created for the pinned one. Only the node count carried
+  // over, which made the mis-attribution look like a continuation.
+  const PINNED_OPENING = [10966439, 68810435, 4215180, 31425736, 93360904];
+  const pinnedFirst = await call('expandCombo', {
+    ydk: YDK, seed: 4242, openingCodes: PINNED_OPENING, maxNodes: 20, maxDepth: 40, topK: 2,
+  });
+  const pinnedData = pinnedFirst.result?.data ?? {};
+  t.check('the pinned slice succeeds', pinnedFirst.ok, true);
+  t.check('  and echoes the seed it was given', pinnedData.seed, 4242);
+  t.check('  and the pinned opening',
+    JSON.stringify(pinnedData.openingCodes), JSON.stringify(PINNED_OPENING));
+  t.assert('  and hands back a job to continue', typeof pinnedData.jobId === 'string', String(pinnedData.jobId));
+  // No seed and no openingCodes here on purpose: the job has to supply both.
+  const continuedPinned = await call('expandCombo', { ydk: YDK, jobId: pinnedData.jobId, maxNodes: 60, topK: 2 });
+  const continuedPinnedData = continuedPinned.result?.data ?? {};
+  t.check('the continuation succeeds', continuedPinned.ok, true);
+  t.check('  and reuses the job seed instead of re-rolling it', continuedPinnedData.seed, pinnedData.seed);
+  t.check('  and searches the same opening',
+    JSON.stringify(continuedPinnedData.openingCodes), JSON.stringify(PINNED_OPENING));
+  t.check('  and the same draw count', continuedPinnedData.drawCount, pinnedData.drawCount);
+  t.check('  and says the draw inputs came from the job', continuedPinnedData.drawInputsSource, 'job');
+  t.check('  and reports the job it continued from', continuedPinnedData.continuedFromJobId, pinnedData.jobId);
+  t.assert('  chaining the node accounting',
+    Number(continuedPinnedData.slice?.nodesAtSliceStart) === Number(pinnedData.nodesSoFar),
+    `start=${continuedPinnedData.slice?.nodesAtSliceStart} first=${pinnedData.nodesSoFar}`);
+  // The hand the engine was rebuilt on is the direct evidence: before the fix this
+  // was the re-derived hand, and the routes played cards that were never dealt.
+  t.check('  and the engine is rebuilt on the pinned hand',
+    JSON.stringify(continuedPinnedData.initialPlayerHand), JSON.stringify(PINNED_OPENING));
+
+  t.section('conflicting draw inputs on a continuation are reported, not obeyed');
+  // The chosen policy: the job wins, and the caller is told what was overruled. The
+  // conflicting opening named below is not in any deck, so a continuation that
+  // obeyed it could not even build its opening.
+  const conflictFirst = await call('expandCombo', { ydk: YDK, seed: 777, maxNodes: 20, maxDepth: 8, topK: 1 });
+  const conflictData = conflictFirst.result?.data ?? {};
+  t.check('the conflict baseline succeeds', conflictFirst.ok, true);
+  const conflictContinue = await call('expandCombo', {
+    ydk: YDK, jobId: conflictData.jobId, seed: 12345, openingCodes: [1, 2, 3, 4, 5], maxNodes: 40, topK: 1,
+  });
+  const conflictContinueData = conflictContinue.result?.data ?? {};
+  t.check('a continuation with conflicting draw inputs still succeeds', conflictContinue.ok, true);
+  t.check('  the job seed wins', conflictContinueData.seed, conflictData.seed);
+  t.check('  the job opening wins',
+    JSON.stringify(conflictContinueData.openingCodes), JSON.stringify(conflictData.openingCodes));
+  const ignored = conflictContinueData.ignoredDrawInputs ?? [];
+  t.check('  the conflicting seed is reported', ignored.find((entry) => entry.name === 'seed')?.supplied, 12345);
+  t.check('  with the job value that was used',
+    ignored.find((entry) => entry.name === 'seed')?.used, conflictData.seed);
+  t.check('  the conflicting opening is reported',
+    JSON.stringify(ignored.find((entry) => entry.name === 'openingCodes')?.supplied), JSON.stringify([1, 2, 3, 4, 5]));
+  t.check('  and the job opening is what was used',
+    JSON.stringify(ignored.find((entry) => entry.name === 'openingCodes')?.used),
+    JSON.stringify(conflictData.openingCodes));
+  t.assert('  and the note says the job draw inputs were used',
+    /job's own draw inputs/.test(String(conflictContinueData.note)), String(conflictContinueData.note));
+  t.check('  a continuation that names no draw input reports no conflict',
+    continuedPinnedData.ignoredDrawInputs, undefined);
+  for (const leftover of [continuedPinnedData.jobId, conflictContinueData.jobId]) {
+    if (typeof leftover === 'string') await call('expandCombo', { ydk: YDK, jobId: leftover, cancel: true });
+  }
 
   t.section('a completed search retains no job');
   // A shallow depth cap empties the DFS frontier well inside the slice, so the
@@ -189,6 +286,33 @@ try {
   const retainAfterContinue = Number(resumedJobsData.retainedJobCount);
   t.assert('continuing consumes the exhausted job rather than keeping it',
     retainAfterContinue <= 1, `retained=${retainAfterContinue}`);
+
+  t.section('a continuation chain is bounded by YGO_COMBO_MAX_CONTINUATIONS');
+  // A runaway-loop guard, not a cost fix: the job store bounds how many chains
+  // exist, not how long one chain runs, so a caller looping `expandCombo({jobId})`
+  // could otherwise hold the search budget forever. This host runs with
+  // YGO_COMBO_MAX_CONTINUATIONS=2, and the chain above has already spent two
+  // continuations (first -> second -> resumedJobs), so the next one is refused —
+  // before any search runs.
+  t.check('the chain reports how many continuations it has spent', resumedJobsData.continuations, MAX_CONTINUATIONS);
+  const overLimit = await search({ ydk: YDK, jobId: resumedJobsData.jobId });
+  t.check('continuing past the limit is refused', overLimit.ok, false);
+  t.check('  with a code that names the limit', overLimit.result?.code, 'COMBO_CONTINUATION_LIMIT');
+  t.check('  naming how many were spent',
+    overLimit.result?.data?.continuations, MAX_CONTINUATIONS);
+  t.check('  and the limit itself', overLimit.result?.data?.continuationLimit, MAX_CONTINUATIONS);
+  t.assert('  and the refusal explains how to proceed',
+    /continuationLimit/.test(String(overLimit.result?.error)), String(overLimit.result?.error));
+  // Dropped, not merely rejected: keeping it would let a caller retry the same
+  // refusal forever, which is the loop this bound exists to end.
+  t.check('  and the capped job was dropped', overLimit.result?.data?.retainedJobCount, 0);
+  const afterLimit = await search({ ydk: YDK, jobId: resumedJobsData.jobId });
+  t.check('  so it cannot be retried', afterLimit.result?.code, 'COMBO_JOB_NOT_FOUND');
+  // A fresh search starts a new chain, so the bound never blocks real work. A
+  // depth cap finishes it inside the slice, so this costs almost nothing.
+  const freshChain = await search({ maxNodes: 100000, maxDepth: 2, timeSliceMs: SHORT_SLICE_MS });
+  t.check('  while a fresh search is not refused', freshChain.ok, true);
+  t.check('  and starts a new chain', freshChain.result?.data?.continuations, 0);
 
   t.section('the job store is bounded by YGO_COMBO_JOB_CAP');
   // This is the failure mode the bound exists for: one retained job holds a
@@ -251,8 +375,10 @@ try {
   await search({ jobId: nodeBudgetData.jobId, cancel: true });
   // Asserting the ceiling over HTTP would mean waiting a full minute of search, so
   // the resolved-budget rules are checked directly instead.
-  const { DEFAULT_COMBO_TIME_SLICE_MS, MAX_COMBO_TIME_SLICE_MS, resolveComboTimeSliceMs } =
-    await import(`file:///${ROOT}/skill/backend/source-adapter.mjs`);
+  const {
+    DEFAULT_COMBO_TIME_SLICE_MS, MAX_COMBO_TIME_SLICE_MS, resolveComboTimeSliceMs,
+    DEFAULT_COMBO_MAX_CONTINUATIONS, MAX_COMBO_MAX_CONTINUATIONS, resolveComboMaxContinuations,
+  } = await import(`file:///${ROOT}/skill/backend/source-adapter.mjs`);
   t.check('the default slice is 15 s', DEFAULT_COMBO_TIME_SLICE_MS, 15000);
   t.check('the ceiling is 60 s', MAX_COMBO_TIME_SLICE_MS, 60000);
   t.check('an absent slice takes the default', resolveComboTimeSliceMs(undefined), DEFAULT_COMBO_TIME_SLICE_MS);
@@ -260,6 +386,17 @@ try {
   t.check('a negative slice takes the default', resolveComboTimeSliceMs(-5), DEFAULT_COMBO_TIME_SLICE_MS);
   t.check('an absurd slice is clamped to the ceiling', resolveComboTimeSliceMs(999999), MAX_COMBO_TIME_SLICE_MS);
   t.check('a slice inside the range is honored', resolveComboTimeSliceMs(4200), 4200);
+  // The continuation bound is a runaway-loop guard, so the default has to be high
+  // enough that an ordinary multi-slice search never meets it.
+  t.check('the default continuation limit is high', DEFAULT_COMBO_MAX_CONTINUATIONS, 32);
+  t.assert('  and well above any ordinary chain', DEFAULT_COMBO_MAX_CONTINUATIONS >= 16,
+    String(DEFAULT_COMBO_MAX_CONTINUATIONS));
+  t.check('an absent limit takes the default',
+    resolveComboMaxContinuations(undefined), DEFAULT_COMBO_MAX_CONTINUATIONS);
+  t.check('a zero limit takes the default', resolveComboMaxContinuations(0), DEFAULT_COMBO_MAX_CONTINUATIONS);
+  t.check('a negative limit takes the default', resolveComboMaxContinuations(-1), DEFAULT_COMBO_MAX_CONTINUATIONS);
+  t.check('a limit inside the range is honored', resolveComboMaxContinuations(5), 5);
+  t.check('an absurd limit is clamped', resolveComboMaxContinuations(99999), MAX_COMBO_MAX_CONTINUATIONS);
 
   t.section('host responsiveness: a cheap tool call while a long job exists');
   // Readiness is asserted once more immediately before the measurement, and it is

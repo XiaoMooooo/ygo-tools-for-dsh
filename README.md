@@ -40,14 +40,24 @@ dsh plugin --profile desktop add "https://github.com/XiaoMooooo/ygo-tools-for-ds
 
 安装或升级后需要**重启 DSH**，插件在启动时载入，替换 `node_modules` 不会热更新运行中的进程。
 
-然后在预设的 `agent.cordis.yml` 中挂载：
+**挂载是自动的，不需要手工编辑预设文件。** 包内附带 `cordis.patch.yml`（内容就是那条
+`- insert: {id: ygo-tools, name: ygo-tools-for-dsh}`），`package.json` 用
+`dsh.bundle.patch` 指向它；安装时插件管理器据此把这个包收进 `dsh.profile.bundles`
+并应用补丁层，插件的行会被自动插入组成。重启 DSH 后 16 个工具与技能即可用，
+规则引擎在第一次调用游戏王工具时才启动。
 
 ```yaml
-- id: ygo-tools
-  name: ygo-tools-for-dsh
+# 包内 cordis.patch.yml（随包分发，无需你写）
+- insert:
+    - id: ygo-tools
+      name: ygo-tools-for-dsh
+      config: {}
 ```
 
-使用该预设创建新会话即可。规则引擎会在第一次调用游戏王工具时启动。
+**手工兜底（仅限不识别 `dsh.bundle.patch` 的旧运行时）**：判断依据是 profile 的
+`dsh.profile.bundles` 里看不到本包、工具也不出现。此时把上面那段完全相同的 `insert`
+手写进 profile 自己的 `cordis.patch.yml` 即可（补丁只做插入，不改动任何既有配置，
+插件自带空配置，不影响启动）。
 
 ## 项目概览
 

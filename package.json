@@ -1,6 +1,6 @@
 {
   "name": "ygo-tools-for-dsh",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Native DeepSeek Harness tools for Yu-Gi-Oh card research, deck analysis, verified duel simulation, replay analysis, and YGOPro2 bridging.",
   "private": true,
   "license": "0BSD",
@@ -39,7 +39,7 @@
     "node": ">=20.11.0"
   },
   "scripts": {
-    "test": "node tests/contract.test.mjs && node tests/write-policy.test.mjs && node tests/search-order.test.mjs && node tests/engine-host.test.mjs && node tests/combo-slice.test.mjs && node tests/packaging.test.mjs"
+    "test": "node tests/contract.test.mjs && node tests/write-policy.test.mjs && node tests/search-order.test.mjs && node tests/state-stats.test.mjs && node tests/engine-host.test.mjs && node tests/combo-slice.test.mjs && node tests/packaging.test.mjs"
   },
   "keywords": [
     "yugioh",

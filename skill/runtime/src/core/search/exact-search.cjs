@@ -1,6 +1,7 @@
 'use strict';
 
 const { compareStrings } = require('./action-order.cjs');
+const { coarseStateKey, conservativeStateKey } = require('./state-keys.cjs');
 
 function createExactSearchApi(deps) {
   const {
@@ -116,6 +117,25 @@ function createExactSearchApi(deps) {
 
   function normalizeSearchStopReason(reason, fallback = 'DONE') {
     return typeof reason === 'string' && reason.length > 0 ? reason : fallback;
+  }
+
+  /**
+   * How many already-reached positions this invocation had to re-execute to rebuild
+   * a DFS frame (a history replay), read from the runner.
+   *
+   * Reported by the runner rather than counted here because only the runner knows
+   * whether a restore was satisfied by a snapshot (no replay at all) or had to step
+   * through the encoded history again. `nodes` cannot show it: a replay reaches no
+   * new position, so the node counter does not move. A runner that does not report
+   * the counter reads as 0 — a zero that means "not reported", which is why the
+   * field is documented as such rather than as "no re-walk happened".
+   *
+   * @param {unknown} runner
+   * @returns {number}
+   */
+  function readReplayedHistorySteps(runner) {
+    const steps = Number(runner?.replayedHistorySteps);
+    return Number.isFinite(steps) && steps > 0 ? Math.trunc(steps) : 0;
   }
 
   function resolveSearchNodeLimit(maxNodes) {
@@ -557,6 +577,33 @@ function createExactSearchApi(deps) {
     ].includes(decision.reason);
   }
 
+  // Measurement-only: one snapshot, projected into the two position keys.
+  //
+  // The strict key is the field *plus* the current legal action set — an effect
+  // already used this turn shows up there as a smaller action set — while the
+  // coarse key is the field alone. Sharing the snapshot keeps a measured search to
+  // one capture per node. Nothing here can fail the search: a snapshot that cannot
+  // be taken (or a runner that refuses to normalize one) yields empty keys, and the
+  // collector drops those rather than inventing a position for them.
+  function buildVisitKeys(runner, actions, snapshotOverride = null) {
+    try {
+      const snapshot = snapshotOverride
+        ?? (typeof runner?.captureSnapshot === 'function' ? runner.captureSnapshot() : null);
+      if (!snapshot) return { stateKey: '', coarseKey: '' };
+      const normalized = typeof runner.normalizeExactStateKeySnapshot === 'function'
+        ? runner.normalizeExactStateKeySnapshot(snapshot)
+        : snapshot;
+      return {
+        stateKey: conservativeStateKey(normalized, actions),
+        // A terminal has no next move, so its key is the position key: two orders
+        // that end on the same board must land on the same key.
+        coarseKey: coarseStateKey(normalized),
+      };
+    } catch {
+      return { stateKey: '', coarseKey: '' };
+    }
+  }
+
   function buildCurrentDecisionStateKey(runner, force = false) {
     if (!runner) return '';
     const decision = runner.currentDecision ?? null;
@@ -793,6 +840,15 @@ function createExactSearchApi(deps) {
     // Measurement-only hook. It observes every visited state so callers can size
     // the duplication the search currently pays for; it never feeds the pruning
     // logic, so enabling it cannot change a single search decision.
+    //
+    // Contract: `onStateVisit(key, meta)`.
+    //   - `meta.kind === 'state'` is one consumed node; `key` is the strict key
+    //     (field plus the current legal action set) and `meta.coarseKey` is the
+    //     field-only key for the same position.
+    //   - `meta.kind === 'terminal'` is one settlement, which is NOT a consumed
+    //     node; `key` is the position key, because a terminal has no next move.
+    // Terminals used to be invisible here, which is why an earlier run reported
+    // `terminalVisits: 0` — a zero that meant "not measured", not "no duplicates".
     const onStateVisit = typeof opts.onStateVisit === 'function' ? opts.onStateVisit : null;
     const onCheckpoint = typeof opts.onCheckpoint === 'function' ? opts.onCheckpoint : null;
     const checkpointEvery = Math.max(1, opts.checkpointEvery ?? WEB_ARCHIVE_CHECKPOINT_NODES);
@@ -1079,6 +1135,22 @@ function createExactSearchApi(deps) {
     };
 
     const settleTerminal = (chainValue, snapshotOverride = null, reasonHint = '', stateOverride = null) => {
+      // A terminal has no next move, so its key is a position key rather than an
+      // action-set key: two orders that end on the same board must land on the
+      // same key, or the terminal duplication stays invisible. This is the hook
+      // whose absence reported `terminalVisits: 0` — a zero that meant
+      // "not measured", never "no duplicates".
+      //
+      // The key is *taken* here, while the position is still current, but the hook
+      // is only *emitted* after `best.terminalCount += 1` below. Ordering guarantee:
+      // a settlement that throws before it has been counted is reported to nobody,
+      // so the observed settlement count can never exceed the search's own counter
+      // (`terminals.visits <= terminalCount`). Emitting first — which is what this
+      // used to do — left a window where a throw between the hook and the counter
+      // made the two disagree in exactly the direction the invariant forbids.
+      const terminalKey = onStateVisit
+        ? buildVisitKeys(runner, null, snapshotOverride).coarseKey
+        : '';
       try {
         const captured = snapshotOverride
           ? (() => {
@@ -1143,6 +1215,15 @@ function createExactSearchApi(deps) {
           state: null,
         };
         best.terminalCount += 1;
+        if (onStateVisit && terminalKey) {
+          onStateVisit(terminalKey, {
+            kind: 'terminal',
+            depth: Array.isArray(chainValue) ? chainValue.length : 0,
+            terminal: true,
+            reason: reasonHint,
+            coarseKey: terminalKey,
+          });
+        }
         pushScoredCandidate(candidate, stateOverride, bestDepth);
         if (debugCollector?.noteTerminal) {
           debugCollector.noteTerminal({
@@ -1382,7 +1463,14 @@ function createExactSearchApi(deps) {
         }
 
         if (onStateVisit) {
-          onStateVisit(buildCurrentDecisionStateKey(runner, true), { depth, terminal: false, reason: null });
+          const keys = buildVisitKeys(runner, runner.currentDecision?.actions);
+          onStateVisit(keys.stateKey, {
+            kind: 'state',
+            depth,
+            terminal: false,
+            reason: null,
+            coarseKey: keys.coarseKey,
+          });
         }
         const forcedAction = sortedActions[0];
         runner.step(forcedAction);
@@ -1547,10 +1635,13 @@ function createExactSearchApi(deps) {
       if (onStateVisit) {
         // One record per consumed node: the children of a branch frame are the
         // other large share of the budget besides the forced chains.
-        onStateVisit(buildCurrentDecisionStateKey(runner, true), {
+        const keys = buildVisitKeys(runner, runner.currentDecision?.actions);
+        onStateVisit(keys.stateKey, {
+          kind: 'state',
           depth: frame.depth,
           terminal: !!runner.currentDecision?.terminal,
           reason: runner.currentDecision?.reason ?? null,
+          coarseKey: keys.coarseKey,
         });
       }
       runner.step(action);
@@ -1734,6 +1825,11 @@ function createExactSearchApi(deps) {
     // used to be resumable in the parallel path only. The caller decides what it
     // keeps; here we only stop throwing the work away.
     best.resumeState = searchCompleted ? null : buildCurrentResumeState();
+    // Per-invocation re-walk accounting: the steps this slice spent re-executing
+    // positions a previous slice had already reached. Reported next to the time
+    // slice so a caller can see the overhead it is paying for continuing instead of
+    // restarting; it never feeds a search decision.
+    best.revisitedNodes = readReplayedHistorySteps(runner);
     // Report the slice boundary in the same vocabulary as the node budgets: the
     // caller reads `stopReason`/`completed`, and only needs the raw numbers to
     // decide whether another slice is worth it.

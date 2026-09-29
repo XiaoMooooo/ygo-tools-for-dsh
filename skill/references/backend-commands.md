@@ -42,17 +42,84 @@ host.
   `expandCombo({jobId,cancel:true})`. `stopReason:"TIME_SLICE"` with
   `completed:false` and `ordersTruncated:true` means the routes are partial, not
   exhausted. Never send a resume state: it stays on the engine host.
+  A continuation keeps the opening its job was created for: the job's own `seed`,
+  `openingCodes` and `drawCount` are reused and echoed back unchanged
+  (`drawInputsSource:"job"`), so the same hand stays under search and
+  `slice.nodesAtSliceStart` chains from the previous `nodesSoFar`. Passing a
+  conflicting `seed`/`openingCodes`/`drawCount` together with a `jobId` is ignored,
+  not obeyed: the call reports the job values it used in `ignoredDrawInputs` (and in
+  `note`) instead of silently searching a different opening.
+  `slice.nodesThisSlice` is the work this slice newly extended; `slice.revisitedNodes`
+  is the work it re-executed to rebuild positions the chain had already reached (a
+  frame restore that had to replay history rather than take a snapshot). Read them
+  together: `nodesThisSlice` alone cannot tell "continued" from "repeated". A `0` in
+  `revisitedNodes` means no restore had to replay — it can also mean the runner
+  does not report the counter, so treat it as a lower bound, never as "the search
+  proved there was no re-walk".
+  A chain may be continued `YGO_COMBO_MAX_CONTINUATIONS` times (default 32, capped
+  at 512 by the env override). Each reply reports how far along the chain it is
+  (`continuations`, `continuationLimit`). Past the limit the call fails with
+  `COMBO_CONTINUATION_LIMIT` **before any search runs**, and the job is dropped so
+  the refusal cannot be retried: start a fresh `expandCombo` call if more searching
+  is genuinely wanted. This is a runaway-loop guard, not a cost fix — it bounds one
+  chain, which the job-store cap (`YGO_COMBO_JOB_CAP`) does not.
+  This entry point is always the single-process serial exact backend
+  (`engine.exactSearchBackend:"js"`, one worker); the parallel-exact backend is only
+  reachable from the command-line search, and it is refused outright when
+  `targetTerminals` is set. Either way the decision is reported, never silent:
+  `engine.parallelism` carries `{requested, active, disabledReason}`, and the
+  command-line search prints the same reason (`disabledReason:"target-terminals"`)
+  when it falls back to one serial process.
+  `measureStates:true` (default off) adds statistics and changes nothing else: the
+  routes are byte-identical with it on or off. The `statistics` block reports
+  `nodes`, `distinctStates`/`duplicateRate` (strict key: the field *plus* the
+  current legal action set), `coarseDistinctStates`/`coarseDuplicateRate` (coarse
+  key: the field alone, ignoring the action set and deck order — the gap between the
+  two rates is the duplication that only shows up once the options already differ),
+  `worstRepeat`, `terminals {visits, distinct, duplicateRate}`,
+  `topK {routes, distinctTerminals, largestVariants}`, and `terminalCountRaw` vs
+  `terminalCountDistinct` (how inflated the raw terminal count is). Both keys
+  include battle position and face-up/face-down for the monster and spell/trap
+  zones, taken from the per-zone card detail the runner already exposes, so a
+  face-down set monster and the same monster face-up are different positions. Each
+  route also carries `terminalKey`/`terminalGroup` (and `terminalVariants` when
+  repeated): routes that end on the same terminal through a different action order
+  are kept and labelled as one group, never merged.
+  Every counted terminal settlement is reported exactly once
+  (`terminals.visits <= terminalCountRaw`): the visit hook fires only after the
+  settlement has been counted, so a settlement that throws first is reported to
+  nobody rather than inflating one side of the pair.
 - `planRoute`: order declared steps by their dependencies and get the valid
   orderings, or an explanation of the cycle, the missing requirement, or the
   unreachable goal that prevents ordering. Purely declarative: no engine runs.
 - `manageCheckpoint`: actions `save`, `restore`, `list`, and `delete`.
 - `analyzeReplay`: actions `parse`, `context`, and `analyze`; `analyze` parses
-  and builds model-readable context in one call.
+  and builds model-readable context in one call. Every reply carries `elapsedMs`,
+  the integer wall clock the engine host measured for that call.
 - `analyzeCombo`: `action:"parse"` normalizes an artifact; `action:"adapt"`
   compares it with the loaded deck.
 - `saveArtifact`: `action:"replay"` or `action:"route"`; use only for an
   explicitly requested file.
 - `manageEngineSession`: actions `status`, `restart`, `clear`, and `shutdown`.
+
+## Reply Timing
+
+Every tool reply except `expandCombo` carries `elapsedMs`: the integer wall clock the
+engine host spent handling that one call, measured from the start of tool dispatch
+(so a first call that also creates the session and cold starts the engine reports
+what it really cost) to the moment the reply was built.
+
+It deliberately **excludes the HTTP transport** between the DSH plugin and the engine
+host, and therefore the request/response transfer and its JSON serialisation: the
+caller's own round trip is always a little longer than this number. It is measured,
+never estimated. Two caveats worth knowing:
+
+- `expandCombo` has no `elapsedMs` on purpose: its `searchElapsedMs` and
+  `slice.consumedMs` already report the search it exists for, and a second,
+  differently-windowed number in the same reply would only invite the two to be
+  compared as if they measured one thing.
+- `manageEngineSession` reports it too, but a `restart` finishes in the client
+  *after* the host replies, so that action's total time is not this number.
 
 ## Discipline And Evidence
 

@@ -45,7 +45,7 @@ export const TOOL_DESCRIPTIONS = Object.freeze({
   listActions: 'Return a compact bounded page of current legal actions, optionally filtered by category, with factorized-selection constraints when a full combination set would be too large.',
   executeAction: 'Execute one current legal action and return the updated state plus next legal actions so another state/action fetch is normally unnecessary.',
   simulateActions: 'Simulate a short legal action sequence and restore the original live state afterward.',
-  expandCombo: 'Search engine-verified combo routes for the loaded deck and return ranked action lines, instead of stepping one action per call. The search runs inside the engine host: use this instead of writing your own search script or harness. Every call is bounded by a wall-clock slice; a search that runs out of it stops cleanly and returns resumable:true with a jobId, which expandCombo({jobId}) continues and expandCombo({jobId,cancel:true}) drops.',
+  expandCombo: 'Search engine-verified combo routes for the loaded deck and return ranked action lines, instead of stepping one action per call. The search runs inside the engine host: use this instead of writing your own search script or harness. Every call is bounded by a wall-clock slice; a search that runs out of it stops cleanly and returns resumable:true with a jobId, which expandCombo({jobId}) continues and expandCombo({jobId,cancel:true}) drops. A continuation keeps the opening the job was created for: the seed, openingCodes and drawCount it searched with are reused and echoed back unchanged (drawInputsSource:"job"), so every slice searches the same hand and the node accounting chains (slice.nodesAtSliceStart continues from the previous nodesSoFar). If seed/openingCodes/drawCount are supplied together with a jobId and disagree with the job, they are ignored and listed in ignoredDrawInputs with the job value that was used instead; only the jobId is needed to continue. slice reports what the slice paid for: nodesThisSlice is newly extended nodes and revisitedNodes is engine steps re-executed to rebuild positions the chain had already reached (a frame restore that had to replay history instead of taking a snapshot; 0 can also mean the runner did not report it). A continuation chain is bounded by YGO_COMBO_MAX_CONTINUATIONS (continuations / continuationLimit are reported, default 32): past it the call fails with COMBO_CONTINUATION_LIMIT and the job is dropped, so a loop cannot hold the search budget forever — start a fresh search instead. This entry point always runs the single-process serial exact backend (engine.exactSearchBackend "js", one worker) and says so in engine.parallelism {requested, active, disabledReason}; the parallel-exact backend used by the command-line search is refused outright when targetTerminals is set, and reports that reason instead of degrading silently. Set measureStates:true only to have the same search also report how much of its node budget went to positions it had already seen: the statistics change no decision and the routes are byte-identical either way.',
   planRoute: 'Order declared combo steps by their dependencies and return valid orderings, or explain why they cannot be ordered.',
   saveCheckpoint: 'Save the current live runner state as an in-memory checkpoint.',
   restoreCheckpoint: 'Restore an in-memory checkpoint by id, name, or latest checkpoint.',
@@ -268,9 +268,9 @@ export const TOOL_INPUT_SCHEMAS = Object.freeze({
     type: 'object',
     properties: {
       ydk: { type: 'string', minLength: 1 },
-      openingCodes: { type: 'array', items: { type: 'integer', minimum: 1 }, maxItems: 10 },
-      seed: { type: 'integer', minimum: 0 },
-      drawCount: { type: 'integer', minimum: 1 },
+      openingCodes: { type: 'array', items: { type: 'integer', minimum: 1 }, maxItems: 10, description: 'The fixed opening hand to search, in hand order, or omit it to let the engine draw one from `seed`. On a continuation this is taken from the job and echoed back unchanged; a different list passed together with a jobId is ignored and reported in ignoredDrawInputs.' },
+      seed: { type: 'integer', minimum: 0, description: 'Seed for the engine-drawn opening hand, so the same call is reproducible. On a continuation the job\'s own seed is reused and echoed back unchanged; a different seed passed together with a jobId is ignored and reported in ignoredDrawInputs.' },
+      drawCount: { type: 'integer', minimum: 1, description: 'Number of cards to draw for the opening hand. On a continuation the job\'s own drawCount is reused; a different one passed together with a jobId is ignored and reported in ignoredDrawInputs.' },
       maxNodes: { type: 'integer', minimum: 1 },
       maxDepth: { type: 'integer', minimum: 1 },
       topK: { type: 'integer', minimum: 1 },
@@ -283,9 +283,13 @@ export const TOOL_INPUT_SCHEMAS = Object.freeze({
       jobId: {
         type: 'string',
         minLength: 1,
-        description: 'Continue the search from a previous slice: pass the jobId the earlier call returned, or null to drop it. The resume state itself stays on the engine host and is never part of this payload.',
+        description: 'Continue the search from a previous slice: pass the jobId the earlier call returned, or null to drop it. The job holds the draw inputs it was created with, so a continuation searches the same opening and echoes the same seed/openingCodes/drawCount; supplying conflicting seed/openingCodes/drawCount alongside a jobId is ignored (they are listed in ignoredDrawInputs with the job value used instead). The resume state itself stays on the engine host and is never part of this payload. One chain may be continued YGO_COMBO_MAX_CONTINUATIONS times (default 32, reported as continuationLimit); past that the call fails with COMBO_CONTINUATION_LIMIT and the job is dropped, so start a fresh search if more is wanted.',
       },
       cancel: { type: 'boolean', description: 'Drop the job named by jobId instead of searching, so a long-lived host does not accumulate continuation handles.' },
+      measureStates: {
+        type: 'boolean',
+        description: 'Statistics only: also report how much of the node budget was spent revisiting positions the search had already seen. It never prunes, reorders, or changes top-K selection, so the routes are byte-identical with it on or off (default off). Adds a `statistics` block: nodes / distinctStates / duplicateRate (keyed on the field plus the current legal action set), coarseDistinctStates / coarseDuplicateRate (field only, ignoring deck order), worstRepeat, terminals {visits, distinct, duplicateRate}, topK {routes, distinctTerminals, largestVariants}, and terminalCountRaw vs terminalCountDistinct (how inflated the raw terminal count is). Counts cover this call only: a continued slice starts its own.',
+      },
       resumeState: {
         type: 'object',
         description: 'Host-private. Never send this: the engine host keeps the resume state keyed by jobId and rejects a payload that carries it.',
@@ -475,10 +479,10 @@ export const PUBLIC_TOOL_DESCRIPTIONS = Object.freeze({
   expandCombo: TOOL_DESCRIPTIONS.expandCombo,
   planRoute: TOOL_DESCRIPTIONS.planRoute,
   manageCheckpoint: 'Save, restore, list, or delete in-memory checkpoints for embedded-runner branch exploration.',
-  analyzeReplay: 'Parse replay bytes or a replay file, build model-readable route context, or do both in one call. Works offline for .yrp, .yrp2 and .yrp3d: it starts its own embedded engine, so it needs neither a live YGOPro2 bridge nor a duel runner. Never parse a replay by hand or with a script.',
+  analyzeReplay: 'Parse replay bytes or a replay file, build model-readable route context, or do both in one call. Works offline for .yrp, .yrp2 and .yrp3d: it starts its own embedded engine, so it needs neither a live YGOPro2 bridge nor a duel runner. Never parse a replay by hand or with a script. Every reply also carries elapsedMs: the integer wall clock the engine host spent handling that call, measured from the start of tool dispatch to the built reply. It excludes the HTTP transport between the plugin and the host (and its JSON serialisation), so the caller\'s own round trip is a little longer. Every ordinary tool reply carries the same field; expandCombo does not, because its searchElapsedMs already reports the search it exists for.',
   analyzeCombo: 'Normalize a combo artifact or adapt it against the deck loaded in the current session.',
   saveArtifact: 'Save a replay or a verified route report after explicit user authorization.',
-  manageEngineSession: 'Inspect, restart, clear, or fully shut down the persistent engine session host.',
+  manageEngineSession: 'Inspect, restart, clear, or fully shut down the persistent engine session host. The reply carries elapsedMs: the integer wall clock this host spent handling the action, excluding the transport to the caller. A restart completes in the client after this reply, so its total time is not that number.',
 });
 
 // Single source of truth for public action routing: which internal tool each

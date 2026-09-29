@@ -105,6 +105,11 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
 
   async function execute(call, options = {}) {
     reapIdleSessions();
+    // One start point for every tool's own measured duration, taken before the
+    // dispatch so a first call that also creates the session (and cold starts the
+    // engine) reports what it really cost. See `withElapsedMs` for what the window
+    // does and does not include.
+    const startedAtMs = Date.now();
     const normalized = normalizeToolCall(call);
     if (!normalized.name) {
       return { ok: false, code: 'INVALID_TOOL_CALL', error: 'Tool call requires a name.' };
@@ -158,11 +163,11 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
         sessionId,
         toolCallId: normalized.id,
         name: normalized.name,
-        result,
+        result: withElapsedMs(result, startedAtMs),
       };
     }
     const session = ensureSession(sessionId);
-    const result = await executePublicTool(normalized.name, session, normalized.input);
+    const result = await executePublicTool(normalized.name, session, normalized.input, startedAtMs);
     return {
       ok: result?.ok !== false,
       sessionId,
@@ -238,7 +243,7 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
     return result;
   }
 
-  async function executePublicTool(name, session, input) {
+  async function executePublicTool(name, session, input, startedAtMs = Date.now()) {
     const context = { session, config: backend.config };
     const action = input.action;
     const payload = withoutKeys(input, 'action');
@@ -266,16 +271,18 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
     }
 
     if (name === 'analyzeReplay') {
-      if (action === 'context') return executeBackend('buildRouteContext');
+      // `startedAtMs` is the dispatch-wide start, so this tool reports the same
+      // window every other tool does rather than its own narrower one.
+      if (action === 'context') return withElapsedMs(await executeBackend('buildRouteContext'), startedAtMs);
       const parsed = await executeBackend('parseYrpRoute');
       if (parsed?.ok === false || action === 'parse') {
         if (parsed?.ok) rememberParsedReplay(session, parsed.data);
-        return parsed;
+        return withElapsedMs(parsed, startedAtMs);
       }
       rememberParsedReplay(session, parsed.data);
       const contextResult = await executeBackend('buildRouteContext', asRecord(parsed.data));
-      if (contextResult?.ok === false) return contextResult;
-      return { ok: true, data: { parsed: parsed.data, context: contextResult.data } };
+      if (contextResult?.ok === false) return withElapsedMs(contextResult, startedAtMs);
+      return withElapsedMs({ ok: true, data: { parsed: parsed.data, context: contextResult.data } }, startedAtMs);
     }
 
     const actions = PUBLIC_TOOL_ACTIONS[name];
@@ -294,7 +301,12 @@ export function createModelToolHost(config = {}, hostOptions = {}) {
         data: { availableActions: Object.keys(actions) },
       };
     }
-    return executeBackend(entry.tool);
+    const dispatched = await executeBackend(entry.tool);
+    // Every tool that fans out through the action table reports its own duration
+    // except `expandCombo`, whose `searchElapsedMs` already covers the search it
+    // exists to report: a second, differently-windowed number in the same reply
+    // would only invite the two to be compared as if they measured one thing.
+    return ELAPSED_MS_EXCLUDED_TOOLS.has(name) ? dispatched : withElapsedMs(dispatched, startedAtMs);
   }
 
   const listToolSchemas = () => PUBLIC_TOOL_NAMES.map((name) => ({
@@ -340,6 +352,37 @@ function withoutKeys(value, ...keys) {
   for (const key of keys) delete output[key];
   return output;
 }
+
+/**
+ * Attach the tool's own measured duration to a tool reply.
+ *
+ * What it measures: the integer wall clock the engine host spent handling that one
+ * tool call, from the start of tool dispatch (session reaping and, on a first call,
+ * session creation included) to the moment the reply object was built.
+ *
+ * What it excludes: the HTTP transport between the DSH plugin and this engine host,
+ * and therefore the request/response transfer and JSON serialisation — so the
+ * caller's own round trip is always a little longer than this number. It is a
+ * measurement of the call, never an estimate, and it is added to the reply's `data`
+ * when there is one, so the parsed payload a caller stored (and the parse result
+ * nested under `analyze`) keeps exactly the shape it had.
+ *
+ * `manageEngineSession` reports it too, with one caveat that is documented in the
+ * tool description: `restart` finishes in the client after this reply, so its total
+ * time is not this number.
+ */
+function withElapsedMs(result, startedAtMs) {
+  const elapsedMs = Math.max(0, Math.round(Date.now() - startedAtMs));
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const data = result.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return result;
+  return { ...result, data: { ...data, elapsedMs } };
+}
+
+/**
+ * Tools that must not gain a second timing field. See the dispatch site.
+ */
+const ELAPSED_MS_EXCLUDED_TOOLS = new Set(['expandCombo']);
 
 function rememberParsedReplay(session, parsed) {
   if (!session || typeof session.mergeMetadata !== 'function') return;

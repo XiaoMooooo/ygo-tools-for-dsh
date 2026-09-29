@@ -125,4 +125,23 @@ t.assert('skill/references/*.md still ship',
   all.filter((p) => p.startsWith('skill/references/') && p.endsWith('.md')).length > 0);
 t.assert('the test suite itself is not published', !all.some((p) => p.startsWith('tests/')));
 
+t.section('the mount patch ships with the bundle');
+// The README says the plugin mounts itself on install and needs no hand-edited
+// preset. That claim rests on three files, so all three are pinned here: the patch
+// inside the tarball, the `dsh.bundle.patch` declaration that points at it, and the
+// row the patch inserts.
+const packageManifest = JSON.parse(readFileSync(`${ROOT}/package.json`, 'utf8'));
+const patchPath = packageManifest.dsh?.bundle?.patch;
+t.assert('cordis.patch.yml is inside the tarball', paths.has('cordis.patch.yml'),
+  'the plugin manager can only apply a patch that ships');
+t.check('  and package.json declares where it is', patchPath, './cordis.patch.yml');
+t.assert('  the declared path resolves to the shipped file',
+  paths.has(String(patchPath).replace(/^\.\//, '')), String(patchPath));
+const patchText = readFileSync(`${ROOT}/cordis.patch.yml`, 'utf8');
+t.assert('  the patch inserts the row the package declares',
+  /insert:/.test(patchText) && new RegExp(`id:\\s*${packageManifest.dsh?.plugin?.id ?? 'ygo-tools'}`).test(patchText),
+  patchText.slice(0, 200));
+t.assert('  naming this package',
+  patchText.includes(packageManifest.name), patchText.slice(0, 200));
+
 t.finish();

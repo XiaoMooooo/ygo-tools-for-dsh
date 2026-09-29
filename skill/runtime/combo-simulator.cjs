@@ -58,6 +58,9 @@ const {
 const {
   createExactSearchApi,
 } = require(path.join(SCRIPT_DIR, 'src', 'core', 'search', 'exact-search.cjs'));
+const {
+  coarseStateKey,
+} = require(path.join(SCRIPT_DIR, 'src', 'core', 'search', 'state-keys.cjs'));
 const { createExactParallelRuntimeApi } = require(path.join(SCRIPT_DIR, 'src', 'runtime', 'exact-parallel-runtime.cjs'));
 const { createSnapshotAccelRuntimeApi } = require(path.join(SCRIPT_DIR, 'src', 'runtime', 'snapshot-accel-runtime.cjs'));
 const { createWorkerEntryApi } = require(path.join(SCRIPT_DIR, 'src', 'runtime', 'worker-entry.cjs'));
@@ -3295,6 +3298,24 @@ class DuelRunner {
     }
   }
 
+  /**
+   * Record one history entry that had to be re-executed to rebuild a position the
+   * search had already reached.
+   *
+   * `restoreState` prefers a snapshot (the state pool or a native snapshot), in
+   * which case nothing is replayed at all; only when it falls back to
+   * `rebuildFromHistory` does the engine step through the encoded history again.
+   * That replay is the re-walk a continued search pays before it extends anything,
+   * and it is invisible in the node counter because no new position is reached —
+   * hence this counter, which the search core reports per slice.
+   *
+   * Initialised lazily so no constructor has to know about it: a runner that never
+   * replays simply reports 0.
+   */
+  noteReplayedHistoryStep() {
+    this.replayedHistorySteps = (this.replayedHistorySteps ?? 0) + 1;
+  }
+
   rebuildFromHistory(history) {
     const startedAt = startProfileTimer();
     try {
@@ -3354,6 +3375,7 @@ class DuelRunner {
             );
             throw err;
           }
+          this.noteReplayedHistoryStep();
           if (this.currentDecision?.terminal) break;
         }
         return;
@@ -3397,6 +3419,7 @@ class DuelRunner {
           );
           throw err;
         }
+        this.noteReplayedHistoryStep();
         if (this.currentDecision?.terminal) break;
       }
     } finally {
@@ -4706,6 +4729,7 @@ class NativeRandomDuelRunner extends DuelRunner {
         }
         this.pushEncodedHistoryAction(this.encodeAction(action));
         this.currentDecision = this.advanceUntilDecision();
+        this.noteReplayedHistoryStep();
         if (this.currentDecision?.terminal) break;
       }
     } finally {
@@ -6860,10 +6884,15 @@ function routeSignature(topPath) {
  * Collapse placement variants of the same line, keeping the best-ranked one and
  * recording how many variants existed.
  *
+ * With `options.measureStates` the emitted route also carries the position key of
+ * the terminal it ended on, which is what lets `groupRoutesByTerminal` tell "same
+ * line, different placement" apart from "same terminal, different order".
+ *
  * @param {any[]} topPaths already ranked by the search core
  * @param {number} requestedTopK
+ * @param {{ measureStates?: boolean }} [options]
  */
-function collapsePlacementVariants(topPaths, requestedTopK) {
+function collapsePlacementVariants(topPaths, requestedTopK, options = {}) {
   const groups = new Map();
   for (const topPath of topPaths) {
     const signature = routeSignature(topPath);
@@ -6874,11 +6903,13 @@ function collapsePlacementVariants(topPaths, requestedTopK) {
     }
     groups.set(signature, { topPath, variants: 1 });
   }
+  const measureStates = options.measureStates === true;
   const routes = [];
   for (const group of groups.values()) {
     if (routes.length >= requestedTopK) break;
     routes.push({
       ...describeComboRoute(group.topPath, routes.length),
+      ...(measureStates ? { terminalKey: terminalKeyForRouteSource(group.topPath) } : {}),
       ...(group.variants > 1 ? { equivalentPlacementVariants: group.variants } : {}),
     });
   }
@@ -6886,44 +6917,129 @@ function collapsePlacementVariants(topPaths, requestedTopK) {
 }
 
 /**
+ * Position key of the terminal a route ended on.
+ *
+ * The board the search settled on is the honest identity of "the same terminal
+ * reached a different way", so it comes from the terminal snapshot the candidate
+ * carries. A candidate whose snapshot is unavailable (score unavailable, snapshot
+ * refused) falls back to its placement-normalized action signature: a weaker key,
+ * but never a wrong one.
+ *
+ * Accepts either a raw search candidate (`chain`, `snapshot`) or a described route
+ * (`steps`, no snapshot), so the fallback works on both shapes.
+ *
+ * @param {any} source
+ */
+function terminalKeyForRouteSource(source) {
+  if (source?.snapshot) return coarseStateKey(source.snapshot);
+  const chain = Array.isArray(source?.chain)
+    ? source.chain
+    : (Array.isArray(source?.steps) ? source.steps : []);
+  return `route:${routeSignature(chain)}`;
+}
+
+/**
+ * Tag routes that ended on the same terminal.
+ *
+ * Variants are KEPT and labelled, never merged: two action orders that reach the
+ * same board are exactly what a human wants to see side by side, and merging them
+ * would hide the very duplication this measurement exists to expose. The
+ * vocabulary is the one `collapsePlacementVariants` already established — a group
+ * reports how many `variants` it has — so `equivalentPlacementVariants` (same line,
+ * different placement) and `terminalVariants` (same terminal, different order) read
+ * as two axes of the same idea.
+ *
+ * @param {any[]} routes
+ */
+function groupRoutesByTerminal(routes) {
+  const list = Array.isArray(routes) ? routes : [];
+  const groups = new Map();
+  const tagged = list.map((route) => {
+    const terminalKey = typeof route?.terminalKey === 'string' && route.terminalKey.length > 0
+      ? route.terminalKey
+      : terminalKeyForRouteSource(route);
+    // Groups are numbered in rank order, so the tag is stable for a given search.
+    let group = groups.get(terminalKey);
+    if (!group) {
+      group = { group: groups.size + 1, variants: 0 };
+      groups.set(terminalKey, group);
+    }
+    group.variants += 1;
+    return { route, terminalKey, terminalGroup: group.group };
+  });
+  return {
+    routes: tagged.map((entry) => ({
+      ...entry.route,
+      terminalKey: entry.terminalKey,
+      terminalGroup: entry.terminalGroup,
+      ...(groups.get(entry.terminalKey).variants > 1
+        ? { terminalVariants: groups.get(entry.terminalKey).variants }
+        : {}),
+    })),
+    distinctTerminals: groups.size,
+    largestVariants: [...groups.values()].reduce((largest, group) => Math.max(largest, group.variants), 0),
+  };
+}
+
+/**
  * Summarize what `measureStates` observed.
  *
- * `visits` counts node visits and `distinctStates` counts different positions, so
+ * `nodes` counts node visits and `distinctStates` counts different positions, so
  * the gap between them is exactly the work a transposition table would remove.
+ * Two projections are reported: the strict one (`distinctStates`, which keys on
+ * the field *and* the legal action set) and the coarse one (`coarseDistinctStates`,
+ * the field alone). Their difference is the duplication that is only apparent once
+ * the options already differ.
+ *
  * The terminal figures matter most: a repeated terminal is one position reported
  * as several results, which is what inflates `terminalCount` and fills top-K with
- * order permutations of a single line.
+ * order permutations of a single line. `terminalCountRaw` is the search's own
+ * count of settled terminals; `terminalCountDistinct` is how many positions those
+ * actually were.
  *
- * @param {Map<string, { count: number, terminalCount: number, depth: number }>} stateVisits
+ * @param {{ strict: Map<string, object>, coarse: Map<string, object>, terminals: Map<string, object> }} stateVisits
+ * @param {{ terminalCountRaw?: number, topK?: { routes: number, distinctTerminals: number, largestVariants: number } }} [context]
  */
-function summarizeStateVisits(stateVisits) {
-  let visits = 0;
-  let terminalVisits = 0;
-  let distinctTerminalStates = 0;
-  let repeatedStates = 0;
-  let worstRepeat = 0;
-  for (const record of stateVisits.values()) {
-    visits += record.count;
-    if (record.count > 1) repeatedStates += 1;
-    if (record.count > worstRepeat) worstRepeat = record.count;
-    if (record.terminalCount > 0) {
-      terminalVisits += record.terminalCount;
-      distinctTerminalStates += 1;
+function summarizeStateVisits(stateVisits, context = {}) {
+  const strict = stateVisits?.strict instanceof Map ? stateVisits.strict : new Map();
+  const coarse = stateVisits?.coarse instanceof Map ? stateVisits.coarse : new Map();
+  const terminals = stateVisits?.terminals instanceof Map ? stateVisits.terminals : new Map();
+  const countVisits = (map) => {
+    let visits = 0;
+    let worstRepeat = 0;
+    for (const record of map.values()) {
+      visits += record.count;
+      if (record.count > worstRepeat) worstRepeat = record.count;
     }
-  }
-  const distinctStates = stateVisits.size;
+    return { visits, worstRepeat };
+  };
+  const strictTotals = countVisits(strict);
+  const coarseTotals = countVisits(coarse);
+  const terminalTotals = countVisits(terminals);
+  const rate = (visits, distinct) => (visits > 0 ? Number(((visits - distinct) / visits).toFixed(4)) : 0);
+  const topK = {
+    routes: Number(context?.topK?.routes) || 0,
+    distinctTerminals: Number(context?.topK?.distinctTerminals) || 0,
+    largestVariants: Number(context?.topK?.largestVariants) || 0,
+  };
   return {
-    visits,
-    distinctStates,
-    duplicateVisits: visits - distinctStates,
-    duplicateRate: visits > 0 ? Number(((visits - distinctStates) / visits).toFixed(4)) : 0,
-    repeatedStates,
-    worstRepeat,
-    terminalVisits,
-    distinctTerminalStates,
-    terminalDuplicateRate: terminalVisits > 0
-      ? Number(((terminalVisits - distinctTerminalStates) / terminalVisits).toFixed(4))
-      : 0,
+    nodes: strictTotals.visits,
+    distinctStates: strict.size,
+    duplicateVisits: strictTotals.visits - strict.size,
+    duplicateRate: rate(strictTotals.visits, strict.size),
+    coarseDistinctStates: coarse.size,
+    coarseDuplicateVisits: coarseTotals.visits - coarse.size,
+    coarseDuplicateRate: rate(coarseTotals.visits, coarse.size),
+    repeatedStates: [...strict.values()].filter((record) => record.count > 1).length,
+    worstRepeat: strictTotals.worstRepeat,
+    terminals: {
+      visits: terminalTotals.visits,
+      distinct: terminals.size,
+      duplicateRate: rate(terminalTotals.visits, terminals.size),
+    },
+    topK,
+    terminalCountRaw: Number(context?.terminalCountRaw) || 0,
+    terminalCountDistinct: terminals.size,
   };
 }
 
@@ -6979,15 +7095,35 @@ async function runComboRouteSearch(options) {
   // Measurement-only. The collected set never feeds pruning, so turning this on
   // cannot change a single search decision; it only reports how much of the node
   // budget is spent revisiting positions the search has already been in.
-  const stateVisits = options.measureStates === true ? new Map() : null;
+  //
+  // Three buckets, because the two questions are different:
+  //   strict    — field + legal action set, i.e. what a transposition table needs;
+  //   coarse    — the field alone, i.e. "same board, whatever the options are";
+  //   terminals — positions the search settled on, keyed by the field alone.
+  // The gap between strict and coarse is how much of the duplication only shows up
+  // once the still-available options already differ.
+  const stateVisits = options.measureStates === true
+    ? { strict: new Map(), coarse: new Map(), terminals: new Map() }
+    : null;
+  const bumpVisit = (map, key, depth) => {
+    const record = map.get(key) ?? { count: 0, depth: 0 };
+    record.count += 1;
+    record.depth = Math.max(record.depth, depth);
+    map.set(key, record);
+  };
   const collectStateVisit = stateVisits
     ? (key, meta) => {
         if (typeof key !== 'string' || key.length === 0) return;
-        const record = stateVisits.get(key) ?? { count: 0, terminalCount: 0, depth: 0 };
-        record.count += 1;
-        if (meta?.terminal) record.terminalCount += 1;
-        record.depth = Math.max(record.depth, Number(meta?.depth) || 0);
-        stateVisits.set(key, record);
+        const depth = Number(meta?.depth) || 0;
+        // A terminal settlement is not a consumed node: counting it in `strict`
+        // would make `nodes` disagree with the search's own node counter.
+        if (meta?.kind === 'terminal') {
+          bumpVisit(stateVisits.terminals, key, depth);
+          return;
+        }
+        bumpVisit(stateVisits.strict, key, depth);
+        const coarseKey = typeof meta?.coarseKey === 'string' && meta.coarseKey.length > 0 ? meta.coarseKey : null;
+        if (coarseKey) bumpVisit(stateVisits.coarse, coarseKey, depth);
       }
     : null;
 
@@ -7045,8 +7181,21 @@ async function runComboRouteSearch(options) {
 
   const { result, searchElapsedMs, initialPlayerHand } = await runSingleSearchJob(job);
   const topPaths = Array.isArray(result?.topPaths) ? result.topPaths : [];
-  const { routes, collapsed } = collapsePlacementVariants(topPaths, requestedTopK);
-  const stateStats = stateVisits ? summarizeStateVisits(stateVisits) : null;
+  const measureStates = stateVisits !== null;
+  const { routes, collapsed } = collapsePlacementVariants(topPaths, requestedTopK, { measureStates });
+  // Tags are statistics, so they only ride along when the measurement was asked
+  // for: an ordinary call keeps the exact route payload it had before.
+  const terminalGroups = measureStates ? groupRoutesByTerminal(routes) : null;
+  const stateStats = stateVisits
+    ? summarizeStateVisits(stateVisits, {
+        terminalCountRaw: result?.terminalCount ?? 0,
+        topK: {
+          routes: terminalGroups.routes.length,
+          distinctTerminals: terminalGroups.distinctTerminals,
+          largestVariants: terminalGroups.largestVariants,
+        },
+      })
+    : null;
   // The raw resume payload is never part of the model-facing result: it carries the
   // serialized DFS stack (root state, every pending frame) and is large enough that
   // serializing it on every hop has already blown a 2 GB V8 heap once (see the
@@ -7059,7 +7208,7 @@ async function runComboRouteSearch(options) {
     openingRemainCount: playerOpening.remain.length,
     initialPlayerHand,
     ...(stateStats ? { stateStats } : {}),
-    routes,
+    routes: terminalGroups ? terminalGroups.routes : routes,
     routesConsidered: topPaths.length,
     routesCollapsedAsPlacementVariants: collapsed,
     nodes: totalNodes,
@@ -7068,6 +7217,11 @@ async function runComboRouteSearch(options) {
     // "continued" from "repeated".
     nodesAtSliceStart: invocationStartNodes,
     nodesThisSlice: Math.max(0, totalNodes - invocationStartNodes),
+    // Engine steps this slice re-executed to rebuild positions it had already
+    // reached (a frame restore that had to replay history instead of taking a
+    // snapshot). Per slice, never cumulative: the counter belongs to the runner,
+    // and a continuation gets a fresh one.
+    revisitedNodes: Number(result?.revisitedNodes) || 0,
     terminalCount: result?.terminalCount ?? 0,
     completed: result?.completed !== false,
     stopReason: result?.stopReason ?? 'UNKNOWN',
@@ -7087,6 +7241,12 @@ async function runComboRouteSearch(options) {
       engineBackend: job.engineBackend,
       exactSearchBackend: job.exactSearchBackend,
       workers: job.workers,
+      // This entry point is single-process and serial by construction, and the
+      // parallel-exact backend refuses to run at all when `targetTerminals > 0`.
+      // Reporting the decision (`requested` / `active` / `disabledReason`) is what
+      // keeps that from being a silent downgrade: nothing here has to be inferred
+      // from a timing difference.
+      parallelism: describeParallelExactSearch(job),
     },
   };
 }
@@ -7282,6 +7442,7 @@ async function runParallelRandomSearch(job) {
 }
 
 const {
+  describeParallelExactSearch,
   shouldUseParallelExactSearch,
   isParallelExactResumeState,
   runParallelExactSearch,
@@ -10450,6 +10611,21 @@ async function main(argv = process.argv.slice(2)) {
     console.log('提示: 当前精确穷举控制后端不启用分片并行，--workers 将按 1 处理。');
   } else if (requestedWorkers > 1 && exactSearchBackend === 'parallel-js') {
     console.log(`提示: 已启用精确穷举分片并行，worker 数=${requestedWorkers}。`);
+  }
+  // Reporting the decision, not just the request. `--target-terminals` disables the
+  // parallel backend outright (see describeParallelExactSearch), and naming that in
+  // the output is the difference between a documented downgrade and a silent one.
+  const parallelDecision = describeParallelExactSearch({
+    exactSingleSearch: true,
+    engineBackend,
+    exactSearchBackend,
+    workers: requestedWorkers,
+    targetTerminals,
+    resumeState: null,
+    exactShards: null,
+  });
+  if (parallelDecision.requested && !parallelDecision.active) {
+    console.log(`提示: 分片并行已被禁用（disabledReason=${parallelDecision.disabledReason}），本次为单进程串行搜索。`);
   }
   if (exportYrpArg !== undefined && enumerateOpenings) {
     console.log('提示: 穷举多组起手时暂不导出 replay，已忽略 --export-yrp。');
