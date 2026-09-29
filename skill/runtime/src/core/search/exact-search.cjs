@@ -1,5 +1,7 @@
 'use strict';
 
+const { compareStrings } = require('./action-order.cjs');
+
 function createExactSearchApi(deps) {
   const {
     cloneHistoryState,
@@ -102,7 +104,9 @@ function createExactSearchApi(deps) {
     return [...(actions ?? [])].sort(
       (a, b) =>
         rankActionForLongestPath(b) - rankActionForLongestPath(a) ||
-        String(a?.label ?? '').localeCompare(String(b?.label ?? ''), 'zh-Hans-CN'),
+        // Code-point order instead of `localeCompare`: the move ordering has to be
+        // identical on every host, or the same search returns different lines.
+        compareStrings(a?.label, b?.label),
     );
   }
 
@@ -122,9 +126,12 @@ function createExactSearchApi(deps) {
     return Number.isFinite(nodeLimit) && nodeLimit > 0 && nodes >= nodeLimit;
   }
 
+  // Ties must be reproducible. This used to read `routeFoundAtMs`, i.e. wall-clock
+  // time, which made equal-score routes come back in a different order on every
+  // run; the node count at discovery is deterministic instead.
   function routeFoundSortValue(candidate) {
-    const value = Number(candidate?.routeFoundAtMs);
-    return Number.isFinite(value) && value > 0 ? value : Number.POSITIVE_INFINITY;
+    const nodes = Number(candidate?.routeFoundNodes);
+    return Number.isFinite(nodes) && nodes >= 0 ? nodes : Number.POSITIVE_INFINITY;
   }
 
   function compareTopPathCandidates(a, b) {
