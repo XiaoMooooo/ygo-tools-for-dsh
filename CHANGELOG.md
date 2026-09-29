@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.3 — 2026-09-29
 
 - **P1：`expandCombo` 不再把主机进程拖死，搜索可切片续跑**。此前整段搜索同步跑在服务所有工具调用的引擎主机进程里：一次 `maxNodes:6000` 的真实调用跑了 120 秒并把主机打死，整个会话随后丢掉全部 16 个 YGO 工具。现在每次 `expandCombo` 都受墙钟切片约束（`timeSliceMs`，默认 15000 ms，上限 60000 ms），切片到时搜索在 DFS 帧边界干净停止，引擎既有的 `resumeState` 被主机按 job id 存放（只保留最近 N 个，`YGO_COMBO_JOB_CAP` 可调，默认 8），返回给模型的只有 `{ jobId, resumable, nodesSoFar, stopReason, slice }`；用 `expandCombo({jobId})` 继续会从断点接着搜（节点数累计增长），`expandCombo({jobId,cancel:true})` 释放。搜索完成的调用不再序列化 resumeState，也不会留下 job。切片内部每 64 个节点 `setImmediate` 让出一次事件循环，所以长任务进行中同进程的其它工具调用仍能被服务。
 - 新增 `combo-slice` 测试套件（58 项）：切片边界与 `stopReason:"TIME_SLICE"` 的诚实报告、续跑节点累计增长、模型负载不含 resume state 且 < 100 KB、完成即不留 job、job 存储有界且淘汰最旧、以及「长任务进行中 `queryCards` 仍能应答」。
@@ -9,6 +9,9 @@
 - **新增 `planRoute` 工具（第 16 个公开工具）**：把展开步骤的依赖（`requires` / `provides` / `after`）建成显式 DAG，用拓扑排序给出**多条合法顺序**，并明确报告环、无提供者的需求、未知引用、目标是否可达，以及关键路径（最少步数）。纯函数、不碰引擎，输出仍需逐步执行验证。
 - **搜索结果可复现**：移动排序与路线排名的 tie-break 不再依赖 `localeCompare` 与墙钟时间，改为码点比较与「发现时节点数」；同一 seed 两次运行得到逐字节一致的路线。
 - 新增纯模块 `action-order.cjs`（交换律规范化与签名分组）与 `route-planner.cjs`，配套 46 项单测。
+- **工具描述补上「它能干这个」和「不许绕开它」**：一次真实会话花了 18.9 分钟、183 次工具调用，却**一次都没用插件**（自己复制 skill、全盘搜 `ocgcore.dll`、自建 harness），最后给出「水母当不了邓氏的 cost」这种错误结论——那是自建 harness 里自动应答造成的假阴性（实际邓氏① 的 cost 只要求手卡里另一只**水属性**怪兽）。现在 `analyzeReplay` 的描述写明它**离线**解析 `.yrp`/`.yrp2`/`.yrp3d`、自带内嵌引擎、不需要活的 YGOPro2 桥，且**不得手写解析**（实测同一份回放 573 ms 解析完成，而那次会话为此绕了二十分钟）；`expandCombo` 的描述写明搜索跑在引擎主机内，用它而不是自己写脚本。
+- `skill/references/backend-commands.md` 新增 **Tooling Discipline**：否定性观察（「引擎不给这个动作」）只在正规工具路径下算证据；cost 与效果、选发「才能发动」与必发触发、「時」与「場合」这类只看措辞的规则，必须由卡文与工具输出裁定。
+- **搜索结果不再截断卡文**：搜索路径此前只给以关键词为中心的 220 字片段，恰好会切掉决定判定的措辞（「才能发动」「可以」等）；现在同时返回全文 `effectText` 与片段 `effectSnippet`。
 
 ## 1.2.2 — 2026-09-29
 
