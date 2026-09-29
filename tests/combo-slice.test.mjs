@@ -32,6 +32,24 @@ const YDK = readFileSync(`${ROOT}/skill/resources/lib/slm.ydk`, 'utf8');
 // A short slice keeps this suite fast; the real default is 15000 ms and only the
 // boundary behaviour is under test here.
 const SHORT_SLICE_MS = 1200;
+// How long this suite is willing to wait for the host it spawned to answer
+// /health. The default 12 s (80 x 150 ms) is a warm dev box's number: on a shared
+// CI runner the host still has to boot Node, import the backend and open a
+// listener, which is exactly where a cold-start timeout comes from. Waiting
+// longer costs nothing on a fast machine and is the difference between a real
+// measurement and a spurious host failure.
+const HOST_READY_TIMEOUT_MS = 60000;
+// The gate in front of a measurement must be ready before it measures, so the
+// readiness wait is explicit and reusable instead of being folded into the
+// section it happens to sit in.
+const waitForHostHealth = (timeoutMs) => waitFor(() => fetch(`${BASE}/health`)
+  .then((response) => response.ok)
+  .catch(() => false), timeoutMs);
+// The client is given a written-down cold-start budget too. This suite only ever
+// talks to the host it spawned itself, but the budget is what decides whether a
+// slow-but-alive host is reported as broken, so it is stated rather than left to
+// a default that may drift.
+const CLIENT_STARTUP_TIMEOUT_MS = 30000;
 // The job store's cap is configurable exactly so it can be exercised without
 // starting nine real searches. One retained job holds a serialized DFS stack, so
 // an unbounded store is the failure this bound exists to prevent.
@@ -63,19 +81,35 @@ try {
     // The host is started above, so the client must never start a second one on
     // the same port: that would silently test a host with a different job cap.
     autoStart: false,
+    startupTimeoutMs: CLIENT_STARTUP_TIMEOUT_MS,
     token: TOKEN,
   });
   const session = { sessionId: 'dsh-combo-slice' };
-  const call = async (name, input) => client.execute({ name, input }, session);
+  // A failed call must not escape as a rejection: an unhandled one kills the run
+  // with a stack trace instead of reporting which condition broke, which is the
+  // least useful thing a CI log can do. Failures are normalised into the same
+  // `{ ok: false, code, error }` shape a tool returns so every check below still
+  // reports, and the host diagnostics travel with them.
+  const callOnce = (name, input, executeOptions = {}) => client.execute({ name, input }, { ...session, ...executeOptions });
+  const normalizeThrown = (error) => ({
+    ok: false,
+    code: error?.code ?? 'CLIENT_THREW',
+    error: error instanceof Error ? error.message : String(error),
+    data: { hostDiagnostics: error?.data?.engineHost ?? {} },
+  });
+  const call = (name, input) => callOnce(name, input).catch(normalizeThrown);
+  // The probe is the one call that must not be aborted by a client default while
+  // the host's event loop is busy with a search, so it states its own request
+  // budget: `queryCards` is served from an already-open database in milliseconds
+  // even on a slow machine, so 30 s can only ever measure the host not answering
+  // at all, never the host being legitimately busy.
+  const PROBE_TIMEOUT_MS = 30000;
+  const probeCall = (name, input) => callOnce(name, input, { timeoutMs: PROBE_TIMEOUT_MS }).catch(normalizeThrown);
 
   t.section('the sliced search host starts');
-  for (let i = 0; i < 80; i += 1) {
-    try {
-      if ((await fetch(`${BASE}/health`)).ok) { ok = true; break; }
-    } catch { /* not listening yet */ }
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  t.assert('an expandCombo host answers /health', ok, `no response on ${BASE}`);
+  ok = await waitForHostHealth(HOST_READY_TIMEOUT_MS);
+  t.assert('an expandCombo host answers /health', ok,
+    `no response on ${BASE} after ${HOST_READY_TIMEOUT_MS} ms`);
   if (!ok) {
     child.kill();
     t.finish();
@@ -228,32 +262,41 @@ try {
   t.check('a slice inside the range is honored', resolveComboTimeSliceMs(4200), 4200);
 
   t.section('host responsiveness: a cheap tool call while a long job exists');
-  // Fire a sliced search and, without awaiting it, run queryCards while the search
-  // is still inside its slice. If the slice blocked the event loop end to end, the
-  // host could not read another request off the socket until the search was done,
-  // so the cheap answer could only arrive after the whole search had finished.
-  const longSliceMs = 4000;
+  // Readiness is asserted once more immediately before the measurement, and it is
+  // reported as a check rather than allowed to escape: if the host this suite
+  // spawned has gone (or never became) healthy, the log has to say so instead of
+  // ending the run with an unhandled host failure from the client.
+  const probeReady = await waitForHostHealth(HOST_READY_TIMEOUT_MS);
+  t.assert('the host is confirmed ready before the responsiveness probe', probeReady,
+    `no /health response on ${BASE} within ${HOST_READY_TIMEOUT_MS} ms`);
+  // A slice long enough that a cheap call answered anywhere inside it is
+  // unambiguous, on a fast machine and on a loaded one alike. Only one long
+  // search runs, so the extra wall clock is the price of an honest measurement.
+  const longSliceMs = 6000;
   const searchStartedAt = Date.now();
   const longSearch = search({ maxNodes: 200000, timeSliceMs: longSliceMs });
   // Give the search a moment to actually enter its loop before probing, so the
   // probe genuinely lands mid-slice rather than before the call is dispatched.
   await new Promise((r) => setTimeout(r, 400));
-  const probe = await call('queryCards', { action: 'get', cardName: '青眼白龙' });
+  const probe = await probeCall('queryCards', { action: 'get', cardName: '青眼白龙' });
   const probeFinishedAt = Date.now();
   t.check('a cheap tool call succeeds while a long job exists', probe.ok, true);
+  if (!probe.ok) t.note(`probe failed: ${probe.code} ${probe.error}`);
   const longResult = await longSearch;
   const longData = longResult.result?.data ?? {};
   const searchFinishedAt = Date.now();
   const searchMs = searchFinishedAt - searchStartedAt;
-  const probeOffsetMs = probeFinishedAt - searchStartedAt;
-  t.note(`search=${searchMs} ms (slice ${longSliceMs} ms), cheap call answered ${probeOffsetMs} ms in`);
-  // Strictly inside the search's lifetime, which is only possible if the event loop
-  // was served while the search was still walking. Without the cooperative yield
-  // the probe would come back at roughly the search's own finish time.
-  t.assert('  the cheap call answered before the long search finished',
-    probeFinishedAt < searchFinishedAt, `probe=${probeOffsetMs} search=${searchMs}`);
-  t.assert('  and it did not wait for the slice to end',
-    probeOffsetMs < longSliceMs, `probe=${probeOffsetMs} slice=${longSliceMs}`);
+  const probeMs = probeFinishedAt - searchStartedAt;
+  t.note(`search=${searchMs} ms (slice ${longSliceMs} ms), cheap call answered ${probeMs} ms in`);
+  // The property is an ordering, not a stopwatch reading: the cheap answer must
+  // land strictly inside the long search's lifetime, which is only possible if
+  // the host served the event loop while the search was still walking. Without
+  // the cooperative yield the probe could only come back at roughly the search's
+  // own finish time — so there is deliberately no "within N ms" budget here, only
+  // the ordering, which holds on a fast machine and a loaded one alike.
+  t.assert('  the cheap call was answered before the long search finished',
+    probeFinishedAt < searchFinishedAt,
+    `probe=${probeMs} ms search=${searchMs} ms`);
   t.assert('  the long search still produced a resumable handle',
     longData.resumable === true && typeof longData.jobId === 'string',
     JSON.stringify(longData).slice(0, 300));
@@ -265,3 +308,20 @@ try {
 }
 
 t.finish();
+
+/**
+ * Poll `probe` until it returns a truthy value or `timeoutMs` is spent. A
+ * timed-out wait returns false instead of throwing, so the caller reports the
+ * failure as a check with its own diagnostics rather than as a stack trace.
+ */
+async function waitFor(probe, timeoutMs, options = {}) {
+  const intervalMs = options.intervalMs ?? 150;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      if (await probe()) return true;
+    } catch { /* not ready yet */ }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}

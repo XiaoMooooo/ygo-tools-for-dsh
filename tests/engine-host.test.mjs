@@ -73,13 +73,19 @@ host.clearSessions();
 t.check('clearSessions empties the map', host.listSessions().length, 0);
 
 t.section('contract codes over HTTP (client + spawned host)');
-const { createPersistentEngineClient } = await import(`file:///${ROOT}/skill/backend/persistent-engine-client.mjs`);
+const { createPersistentEngineClient, DEFAULT_STARTUP_TIMEOUT_MS } =
+  await import(`file:///${ROOT}/skill/backend/persistent-engine-client.mjs`);
 const client = createPersistentEngineClient({
   hostname: '127.0.0.1',
   port: PORT,
   autoStart: true,
   serverEnv: { YGO_CACHE_DIR: join(DATA, 'cache') },
 });
+// A cold start on a slow machine is the difference between a slow first tool call
+// and a failed one, so the default budget is asserted instead of left implicit: it
+// must stay at 30 s (the plugin's own default) and never drift back to a value
+// that assumes a warm developer machine.
+t.check('the client default cold-start budget is 30 s', DEFAULT_STARTUP_TIMEOUT_MS, 30000);
 const session = { sessionId: 'dsh-test' };
 const call = async (name, input) => {
   const raw = await client.execute({ name, input }, session);
@@ -180,11 +186,15 @@ t.assert('a start against an occupied port fails', firstFailure !== null,
   'the client reported success on an occupied port');
 t.check('  with the dead-host code the plugin classifies on', firstFailure?.code, 'ENGINE_HOST_FAILURE');
 // The pre-fix client threw the cached protocol mismatch on the first probe and
-// never looked again; a recovering client keeps probing and does try to start.
+// never looked again; a recovering client keeps probing for the whole patience
+// window instead.
 t.assert('the client kept probing instead of re-throwing a cached mismatch',
   healthProbes > 5, `probes=${healthProbes}`);
-t.assert('the failure shows a fresh cold start was attempted',
-  /exited|did not become ready/.test(firstFailure?.message ?? ''), firstFailure?.message);
+// A port owned by a service that is not the engine host must not be raced: the
+// child spawned over it could only die on EADDRINUSE, and the caller would pay the
+// whole startup budget to learn that. The failure has to name the owning service.
+t.assert('the failure names the foreign service that owns the port',
+  /incompatible service/i.test(firstFailure?.message ?? ''), firstFailure?.message);
 const failedHealth = await blockedClient.health();
 t.check('the failed probe reports the foreign service as reachable', failedHealth.reachable, true);
 t.check('the failed probe asks for a restart', failedHealth.needsRestart, true);

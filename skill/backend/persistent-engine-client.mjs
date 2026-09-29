@@ -9,12 +9,37 @@ import { ENGINE_TOKEN_ENV, ENGINE_TOKEN_HEADER, resolveEngineToken, resolveEngin
 
 const SERVER_ENTRY = fileURLToPath(new URL('./persistent-engine-server.mjs', import.meta.url));
 
+/**
+ * Default cold-start budget. A host has to boot Node, import ~90 KB of backend
+ * modules and open a listener; a slow, loaded machine (a shared CI runner doing
+ * many things at once) does that far slower than a warm dev box. The plugin entry
+ * has always defaulted to 30 s and passes that down, so 15 s only ever applied to
+ * a client built without options — the case where nobody has chosen a budget and
+ * where a failed first tool call is the worst outcome. A slow first call beats a
+ * failed one, so the two defaults are now the same bounded number.
+ */
+export const DEFAULT_STARTUP_TIMEOUT_MS = 30000;
+/**
+ * `/health` is a loopback request whose only job is to say "someone owns this
+ * port". 1500 ms was tight enough to be aborted by a host that was merely busy
+ * (a sliced search legally holds the event loop for one search step at a time),
+ * and a timed-out probe used to be read as "the host is gone".
+ */
+const HEALTH_PROBE_TIMEOUT_MS = 3000;
+/**
+ * How long to keep asking a host that is answering but only slowly. An alive
+ * port must be re-probed for a while before anything is called unavailable: a
+ * later probe can already succeed, and a host that never answers again is still
+ * reported after this bound instead of hanging the caller.
+ */
+const HEALTH_PROBE_PATIENCE_MS = 5000;
+
 export function createPersistentEngineClient(options = {}) {
   const hostname = readString(options.hostname ?? process.env.YGO_ENGINE_HOST) ?? DEFAULT_ENGINE_HOST;
   const port = normalizePort(options.port ?? process.env.YGO_ENGINE_HOST_PORT ?? DEFAULT_ENGINE_PORT);
   const baseUrl = `http://${hostname}:${port}`;
   const autoStart = options.autoStart !== false;
-  const startupTimeoutMs = normalizeTimeout(options.startupTimeoutMs, 15000);
+  const startupTimeoutMs = normalizeTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS);
   // The host is spawned with process.env + serverEnv, so the token must be
   // resolved from that same effective environment: serverEnv carries
   // YGO_CACHE_DIR, which decides where the token file lives. Resolving it from
@@ -55,7 +80,7 @@ export function createPersistentEngineClient(options = {}) {
    */
   async function health() {
     try {
-      const result = await requestJson(`${baseUrl}/health`, { timeoutMs: 1500, token: engineToken });
+      const result = await requestJson(`${baseUrl}/health`, { timeoutMs: HEALTH_PROBE_TIMEOUT_MS, token: engineToken });
       if (result.protocol !== ENGINE_HOST_PROTOCOL) {
         const error = `Port ${port} is occupied by an incompatible service.`;
         return {
@@ -63,6 +88,7 @@ export function createPersistentEngineClient(options = {}) {
           ...hostDiagnostics(),
           ok: false,
           reachable: true,
+          probeTimedOut: false,
           needsRestart: true,
           code: 'ENGINE_HOST_PROTOCOL_MISMATCH',
           error,
@@ -77,6 +103,7 @@ export function createPersistentEngineClient(options = {}) {
         ...hostDiagnostics(),
         ok: true,
         reachable: true,
+        probeTimedOut: false,
         // A reachable host that is already closing still owns the port, so it
         // must be replaced instead of reused.
         needsRestart: result.closing === true,
@@ -88,6 +115,11 @@ export function createPersistentEngineClient(options = {}) {
         ...hostDiagnostics(),
         ok: false,
         reachable: false,
+        // A timeout (as opposed to a refused connection) means the port is still
+        // owned by something that did not answer in time: evidence of a slow or
+        // busy host, never evidence that the port is free. `ensureStarted` and
+        // `startAndWait` both branch on this.
+        probeTimedOut: isTimeoutError(error),
         needsRestart: true,
         code: 'ENGINE_HOST_UNAVAILABLE',
         error: message,
@@ -105,11 +137,41 @@ export function createPersistentEngineClient(options = {}) {
       return current;
     }
     if (!autoStart) throw startFailure(current);
-    // The port must be free before spawning: a host that is still shutting down
-    // would make the fresh process die on EADDRINUSE and burn the whole startup
-    // timeout for nothing.
-    if (current.reachable) await waitForUnreachable(2000);
+    // A probe that timed out says the port was kept open but not served within
+    // the bound, which is what a host busy inside one long step looks like. Keep
+    // probing briefly: a mere slow moment must not be turned into a restart (the
+    // old behaviour spawned a second host over the live one, which can only die
+    // on EADDRINUSE and burn the whole startup budget). Nothing is cached here,
+    // so a genuine failure is still reported once this window also runs out.
+    if (isProbeTimeout(current)) {
+      const patient = await waitForHealthy(HEALTH_PROBE_PATIENCE_MS);
+      if (patient) {
+        lastFailure = null;
+        return patient;
+      }
+    }
+    // The port must be genuinely free before spawning, not merely past a fixed
+    // wait: a host that is still shutting down would make the fresh process die
+    // on EADDRINUSE and burn the whole startup timeout for nothing. If the port
+    // is still owned after this bound, the spawn guard in startAndWait refuses
+    // and reports which host is holding it, instead of racing a second one.
+    if (current.reachable || current.probeTimedOut) await waitForUnreachable(2000);
     return startAndWait(current);
+  }
+
+  /**
+   * Poll `/health` until it answers as usable or `timeoutMs` is spent; returns
+   * the answering state or null. Used wherever "is the host up yet" has to be
+   * confirmed on a machine whose speed is unknown, instead of assumed.
+   */
+  async function waitForHealthy(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const current = await health();
+      if (current.ok && current.needsRestart !== true) return current;
+      if (Date.now() >= deadline) return null;
+      await delay(50);
+    }
   }
 
   /**
@@ -130,6 +192,22 @@ export function createPersistentEngineClient(options = {}) {
         // The readiness loop below reports the failure with diagnostics.
       }
       return waitUntilReady(reason, null);
+    }
+    // Spawning is the one action that must never be taken while something still
+    // owns the port: the child would die on EADDRINUSE, and the caller would pay
+    // the whole startup timeout to learn that. A probe timeout is treated as an
+    // occupied port rather than a free one for the same reason. `ensureStarted`
+    // has already spent `HEALTH_PROBE_PATIENCE_MS` re-probing, so this window is
+    // the second and final one: an answering host is used, a still-silent owner
+    // is reported with the reason that named it, and a port that went away inside
+    // the window is the only case that reaches a cold start.
+    if (reason?.reachable || reason?.probeTimedOut) {
+      const alive = await waitForHealthy(HEALTH_PROBE_PATIENCE_MS);
+      if (alive) throw startFailure(alive, alive);
+      throw startFailure(reason, {
+        code: reason?.code ?? 'ENGINE_HOST_PORT_STILL_OWNED',
+        error: `Port ${port} is still owned by a service that did not become a usable engine host, so a new one was not started: ${reason?.error ?? 'no reason reported'}`,
+      });
     }
     const now = Date.now();
     if (lastFailure && now - lastStartAttemptAt < startRetryCooldownMs) {
@@ -246,7 +324,15 @@ export function createPersistentEngineClient(options = {}) {
   }
 
   function startFailure(reason, failure = reason) {
-    const error = new Error(failure?.error ?? 'Persistent engine host is unavailable.');
+    // An owned-but-unanswered port and a vanished host are different situations,
+    // and the log has to say which one the caller hit. The recorded start failure
+    // still wins when there is one, because "did not become ready" is the most
+    // actionable reason of all.
+    let message = failure?.error ?? 'Persistent engine host is unavailable.';
+    if (reason?.probeTimedOut && reason?.reachable !== true && !lastFailure) {
+      message = `Persistent engine host on port ${port} did not answer /health within ${HEALTH_PROBE_TIMEOUT_MS} ms: ${reason.error ?? 'unknown error'}`;
+    }
+    const error = new Error(message);
     // serializeEngineFailure in the plugin entry treats any code other than
     // ENGINE_HOST_FAILURE as an engine-side rejection, so a dead host must keep
     // this exact code; the detail travels in `data` instead.
@@ -362,6 +448,23 @@ function normalizeTimeout(value, fallback) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * True when a failed `/health` probe failed because it ran out of time rather
+ * than because nothing was listening. `fetch` reports an aborted
+ * `AbortSignal.timeout` as a `TimeoutError` with a recognisable message, and a
+ * socket that is accepted but never served also surfaces as a timeout. Both mean
+ * the port is owned, which is the distinction the start path needs.
+ */
+function isTimeoutError(error) {
+  if (!error) return false;
+  if (error.name === 'TimeoutError') return true;
+  return /aborted due to timeout|timed out|timeout/i.test(String(error.message ?? error));
+}
+
+function isProbeTimeout(state) {
+  return state?.probeTimedOut === true && state?.reachable !== true;
 }
 
 function readString(value) {
