@@ -2,6 +2,8 @@
 
 ## 1.2.3 — 2026-09-29
 
+- **修复「装上了却完全不可见」的挂载缺陷（影响所有使用者）**。此前包只声明 `dsh.plugin`（一个**待插入的行**）而没有 `dsh.bundle.patch`，也没有随包附带 `cordis.patch.yml`，于是没有任何东西把这个插件的行插进组成：工具不注册、技能不进目录、19981 没有引擎进程，而且**完全静默**（不报错、不提示）。现在随包附带 `cordis.patch.yml`（`- insert: {id: ygo-tools, name: ygo-tools-for-dsh}`），`package.json` 声明 `dsh.bundle.patch` 指向它，`files` 与 `exports` 同步收录，安装后由插件管理器自动纳入 `dsh.profile.bundles` 并挂载——不再需要手工编辑 profile 的补丁层。
+
 - **P1：`expandCombo` 不再把主机进程拖死，搜索可切片续跑**。此前整段搜索同步跑在服务所有工具调用的引擎主机进程里：一次 `maxNodes:6000` 的真实调用跑了 120 秒并把主机打死，整个会话随后丢掉全部 16 个 YGO 工具。现在每次 `expandCombo` 都受墙钟切片约束（`timeSliceMs`，默认 15000 ms，上限 60000 ms），切片到时搜索在 DFS 帧边界干净停止，引擎既有的 `resumeState` 被主机按 job id 存放（只保留最近 N 个，`YGO_COMBO_JOB_CAP` 可调，默认 8），返回给模型的只有 `{ jobId, resumable, nodesSoFar, stopReason, slice }`；用 `expandCombo({jobId})` 继续会从断点接着搜（节点数累计增长），`expandCombo({jobId,cancel:true})` 释放。搜索完成的调用不再序列化 resumeState，也不会留下 job。切片内部每 64 个节点 `setImmediate` 让出一次事件循环，所以长任务进行中同进程的其它工具调用仍能被服务。
 - 新增 `combo-slice` 测试套件（58 项）：切片边界与 `stopReason:"TIME_SLICE"` 的诚实报告、续跑节点累计增长、模型负载不含 resume state 且 < 100 KB、完成即不留 job、job 存储有界且淘汰最旧、以及「长任务进行中 `queryCards` 仍能应答」。
 - **P0 可用性修复：引擎主机不再永久失联**。此前主机进程崩溃/启动失败后，客户端会把失败状态缓存下来（端口被占用时 `ensureStarted` 直接抛出 `ENGINE_HOST_PROTOCOL_MISMATCH`），后续任何 YGO 工具调用都只能拿到同一个错误，只能重启 DSH 桌面端。现在启动失败只缓存一个 1 秒冷却窗口，冷却后每次调用都会重新冷启动；host 子进程在就绪前退出会立刻失败而不是耗满启动超时。客户端新增 `restart()`（停机 + 清空缓存 + 冷启动），`manageEngineSession` 新增 `action:"restart"`（无需 `confirm`，会丢弃全部引擎会话），`status` 现在返回 `reachable` / `hostname` / `port` / `baseUrl` / `tokenPath` / `lastError` / `needsRestart` 诊断字段，并在主机不可达时先尝试冷启动。

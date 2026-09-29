@@ -16,11 +16,13 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
     "skill",
+    "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -53,6 +55,9 @@
     "@deepseek-ai/cordis": "^4.0.1"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "plugin": {
       "id": "ygo-tools",
       "kind": "tool-set",

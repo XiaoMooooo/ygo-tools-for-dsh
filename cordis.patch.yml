@@ -1,0 +1,18 @@
+# ygo-tools-for-dsh：游戏王工具集 + 技能（DeepSeek Harness 插件）。
+#
+# 这是一个 tool-set 包：它提供的行必须被插入组成（composition）才会生效，
+# 否则完全静默 —— 16 个工具不注册、技能不进目录、19981 无引擎进程。
+# 本补丁就是那次插入；package.json 里的 dsh.bundle.patch 指向它，
+# 插件管理器因此会把这个包当作 bundle 收进 dsh.profile.bundles 并应用。
+#
+# 插件自带空配置，绝不弄崩启动；无需任何账号或密钥。可选配置：
+#
+#   - id: ygo-tools
+#     config:
+#       enginePort: 19981              # 可选：内嵌引擎主机端口
+#       engineStartupTimeoutMs: 30000  # 可选：冷启动预算
+#
+- insert:
+    - id: ygo-tools
+      name: ygo-tools-for-dsh
+      config: {}
