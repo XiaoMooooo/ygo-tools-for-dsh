@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **新增 `planRoute` 工具（第 16 个公开工具）**：把展开步骤的依赖（`requires` / `provides` / `after`）建成显式 DAG，用拓扑排序给出**多条合法顺序**，并明确报告环、无提供者的需求、未知引用、目标是否可达，以及关键路径（最少步数）。纯函数、不碰引擎，输出仍需逐步执行验证。
+- **搜索结果可复现**：移动排序与路线排名的 tie-break 不再依赖 `localeCompare` 与墙钟时间，改为码点比较与「发现时节点数」；同一 seed 两次运行得到逐字节一致的路线。
+- 新增纯模块 `action-order.cjs`（交换律规范化与签名分组）与 `route-planner.cjs`，配套 46 项单测。
+
 ## 1.2.2 — 2026-09-29
 
 - **搜索核心的评分面被运行时删掉**：`removeDecisionScoringSurface` 在建好 runner 后删除 `scoringRules`/`scoreSnapshot`/`scoreSnapshotDetailed`，而搜索核心仍在调用它（`exact-search.cjs:982`），导致每次评分抛异常、所有路线退化为「评分不可用」；并行入口的默认策略 `{minScoreExclusive: 0}` 更会因此过滤掉全部候选。已移除该删除逻辑。

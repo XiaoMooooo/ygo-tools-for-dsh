@@ -1,6 +1,6 @@
 # YGO Tool Guide
 
-Use only the 15 YGO tools registered by the DeepSeek Harness plugin. Do not
+Use only the 16 YGO tools registered by the DeepSeek Harness plugin. Do not
 invoke backend modules, HTTP endpoints, shell commands, or temporary scripts
 during model decision work.
 
@@ -30,6 +30,9 @@ actions `clear` or `shutdown` with `confirm:true` only for explicit teardown.
 - `simulateActions`: compare a short embedded continuation without committing.
 - `expandCombo`: search engine-verified combo routes for the loaded deck and get
   ranked action lines with scores, instead of stepping one action per call.
+- `planRoute`: order declared steps by their dependencies and get the valid
+  orderings, or an explanation of the cycle, the missing requirement, or the
+  unreachable goal that prevents ordering. Purely declarative: no engine runs.
 - `manageCheckpoint`: actions `save`, `restore`, `list`, and `delete`.
 - `analyzeReplay`: actions `parse`, `context`, and `analyze`; `analyze` parses
   and builds model-readable context in one call.

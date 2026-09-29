@@ -36,6 +36,8 @@ const CORE_MODULES = Object.freeze({
   // CommonJS runtime module: read `searchComboRoutes` off `default` when the ESM
   // interop does not surface it as a named export.
   comboSimulator: 'combo-simulator.cjs',
+  // Pure dependency planner: no engine, no session, so it needs no runner.
+  routePlanner: 'src/core/search/route-planner.cjs',
 });
 
 const CURRENT_DUEL_RULE = 5;
@@ -63,6 +65,7 @@ const CORE_TOOL_NAMES = Object.freeze([
   'executeAction',
   'simulateActions',
   'expandCombo',
+  'planRoute',
   'saveCheckpoint',
   'restoreCheckpoint',
   'listCheckpoints',
@@ -286,6 +289,8 @@ async function executeCoreTool(name, config, moduleCache, context, input) {
       return executeNamedExport(config, moduleCache, 'actionTools', name, context, input);
     case 'expandCombo':
       return expandComboRoutes(context, input, config, moduleCache);
+    case 'planRoute':
+      return planComboRoute(input, config, moduleCache);
     case 'saveCheckpoint':
     case 'restoreCheckpoint':
     case 'listCheckpoints':
@@ -888,6 +893,42 @@ async function expandComboRoutes(context, input, config, moduleCache) {
       ...result.data,
     },
   };
+}
+
+/**
+ * Order declared combo steps by their dependencies.
+ *
+ * This is the layer the search cannot provide: it says *why* one step has to
+ * precede another, whether a target is reachable at all, and how many steps the
+ * shortest line needs. It is pure and never touches the engine, so its output is
+ * a candidate order that still has to be executed and verified step by step.
+ */
+async function planComboRoute(input, config, moduleCache) {
+  const module = await loadCoreModule(config, moduleCache, 'routePlanner');
+  const api = module.default ?? module;
+  if (typeof api.planRoute !== 'function') {
+    return { ok: false, code: 'PLANNER_UNAVAILABLE', error: 'route-planner.planRoute is not available.' };
+  }
+  const record = asRecord(input);
+  const planned = api.planRoute({
+    steps: record.steps,
+    available: record.available,
+    goal: record.goal,
+    limit: record.limit,
+    maxExpansions: record.maxExpansions,
+  });
+  if (planned?.ok === false && Array.isArray(planned.diagnostics?.problems) && planned.diagnostics.problems.length > 0
+    && planned.diagnostics.cycles.length === 0 && planned.diagnostics.missing.length === 0) {
+    // Only structural problems (no steps, duplicate ids): report them as an error
+    // rather than as a plan that merely has no orderings.
+    return {
+      ok: false,
+      code: 'PLAN_INPUT_INVALID',
+      error: 'The plan steps could not be read; each step needs a unique non-empty id.',
+      data: { problems: planned.diagnostics.problems },
+    };
+  }
+  return { ok: true, data: { action: 'planRoute', ...planned } };
 }
 
 function getSessionDeck(context) {

@@ -105,7 +105,7 @@ dsh plugin --profile desktop add "https://github.com/XiaoMooooo/ygo-tools-for-ds
 | **卡片** | `queryCards` · `manageCardDataSources` · `getBanlistContext` |
 | **卡组** | `manageSessionDeck` |
 | **决斗** | `resetGame` · `observeDuel` · `executeAction` · `simulateActions` |
-| **展开** | `expandCombo` |
+| **展开** | `expandCombo` · `planRoute` |
 | **状态** | `manageCheckpoint` · `manageEngineSession` |
 | **分析** | `analyzeCombo` · `analyzeReplay` · `saveArtifact` |
 | **桥接** | `manageYgoPro2` |

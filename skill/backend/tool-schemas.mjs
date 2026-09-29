@@ -46,6 +46,7 @@ export const TOOL_DESCRIPTIONS = Object.freeze({
   executeAction: 'Execute one current legal action and return the updated state plus next legal actions so another state/action fetch is normally unnecessary.',
   simulateActions: 'Simulate a short legal action sequence and restore the original live state afterward.',
   expandCombo: 'Search engine-verified combo routes for the loaded deck and return ranked action lines, instead of stepping one action per call.',
+  planRoute: 'Order declared combo steps by their dependencies and return valid orderings, or explain why they cannot be ordered.',
   saveCheckpoint: 'Save the current live runner state as an in-memory checkpoint.',
   restoreCheckpoint: 'Restore an in-memory checkpoint by id, name, or latest checkpoint.',
   listCheckpoints: 'List in-memory checkpoint summaries for the current session.',
@@ -276,6 +277,38 @@ export const TOOL_INPUT_SCHEMAS = Object.freeze({
     },
     additionalProperties: false,
   },
+  planRoute: {
+    type: 'object',
+    properties: {
+      // Root `required` is enforced engine-side only: the DSH parameter DSL exposes
+      // just the property map, so `steps` is explained here in prose too.
+      steps: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 200,
+        description: 'Required. The plan steps. Each declares what it consumes and produces so the order can be derived instead of guessed.',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', minLength: 1, description: 'Required. Stable step id, referenced by other steps and echoed back in every ordering.' },
+            action: { type: 'string', minLength: 1, description: 'The engine action label this step stands for. Defaults to the id.' },
+            requires: { type: 'array', items: { type: 'string', minLength: 1 }, maxItems: 32, description: 'Resources this step consumes; each must be available or produced by another step.' },
+            provides: { type: 'array', items: { type: 'string', minLength: 1 }, maxItems: 32, description: 'Resources this step produces, which later steps may require.' },
+            after: { type: 'array', items: { type: 'string', minLength: 1 }, maxItems: 32, description: 'Step ids that must run before this one even without a shared resource.' },
+            priority: { type: 'integer', description: 'Lower runs earlier when several steps are ready at the same time. Defaults to 0.' },
+          },
+          required: ['id'],
+          additionalProperties: false,
+        },
+      },
+      available: { type: 'array', items: { type: 'string', minLength: 1 }, maxItems: 64, description: 'Resources already in hand, such as cards in the opening hand or bodies on the field.' },
+      goal: { type: 'array', items: { type: 'string', minLength: 1 }, maxItems: 32, description: 'Resources the finished line must produce; the result reports whether the plan can reach them at all.' },
+      limit: { type: 'integer', minimum: 1, description: 'Maximum number of valid orderings to return. Defaults to 5.' },
+      maxExpansions: { type: 'integer', minimum: 1, description: 'Enumeration budget guarding against combinatorial blow-up. Defaults to 20000.' },
+    },
+    required: ['steps'],
+    additionalProperties: false,
+  },
   saveCheckpoint: {
     type: 'object',
     properties: {
@@ -421,6 +454,7 @@ export const PUBLIC_TOOL_DESCRIPTIONS = Object.freeze({
   executeAction: TOOL_DESCRIPTIONS.executeAction,
   simulateActions: TOOL_DESCRIPTIONS.simulateActions,
   expandCombo: TOOL_DESCRIPTIONS.expandCombo,
+  planRoute: TOOL_DESCRIPTIONS.planRoute,
   manageCheckpoint: 'Save, restore, list, or delete in-memory checkpoints for embedded-runner branch exploration.',
   analyzeReplay: 'Parse replay bytes or a replay file, build model-readable route context, or do both in one call.',
   analyzeCombo: 'Normalize a combo artifact or adapt it against the deck loaded in the current session.',
@@ -567,6 +601,7 @@ export const PUBLIC_TOOL_INPUT_SCHEMAS = Object.freeze({
   },
   simulateActions: TOOL_INPUT_SCHEMAS.simulateActions,
   expandCombo: TOOL_INPUT_SCHEMAS.expandCombo,
+  planRoute: TOOL_INPUT_SCHEMAS.planRoute,
   manageCheckpoint: {
     type: 'object',
     properties: {
